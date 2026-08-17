@@ -73,3 +73,8 @@ class KVStore:
                 del self._data[key]
                 return True
             return False
+
+    def key_count(self) -> int:
+        """Return the number of keys currently stored. Used by /health."""
+        with self._lock:
+            return len(self._data)
