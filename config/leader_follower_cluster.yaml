@@ -1,0 +1,32 @@
+# Leader-follower cluster topology and replication policy.
+#
+# Consumed by leader_follower/leader.py (ClusterConfig.from_yaml). The
+# leader is the only thing that reads this file -- followers don't need
+# to know about the rest of the cluster, only their own node_id/port,
+# which they get from CLI args/env vars (see follower.py).
+
+# Followers the leader replicates every write to, as host:port pairs.
+# Order doesn't matter -- writes fan out to all of them concurrently.
+followers:
+  - host: 127.0.0.1
+    port: 8001
+  - host: 127.0.0.1
+    port: 8002
+
+# Number of follower acks the leader waits for before responding success
+# to the client. Must be between 0 and len(followers):
+#   0              = fire-and-forget: return to the client immediately,
+#                    don't wait on any follower. Lowest latency, no
+#                    durability guarantee beyond the leader itself.
+#   len(followers) = fully synchronous: every follower must ack.
+#                    Highest latency, strongest durability.
+# Followers that ack after the client has already gotten a response
+# (because ack_required was reached, or because the timeout below fired)
+# still get the write applied -- they just aren't waited on.
+ack_required: 1
+
+# Max seconds the leader waits for `ack_required` acks before giving up
+# and failing the write back to the client (fail loudly, no partial
+# success). This is also used as the per-request HTTP timeout for calls
+# to followers, so a single unresponsive follower can't hang forever.
+timeout_seconds: 2.0
