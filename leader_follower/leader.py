@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import logging
 import os
 import time
@@ -86,11 +87,7 @@ class ClusterConfig:
         ack_required = int(raw.get("ack_required", 0))
         timeout_seconds = float(raw.get("timeout_seconds", 2.0))
 
-        if not 0 <= ack_required <= len(followers):
-            raise ValueError(
-                f"ack_required ({ack_required}) must be between 0 and "
-                f"the number of followers ({len(followers)})"
-            )
+        cls._validate_ack_required(ack_required, followers)
         if timeout_seconds <= 0:
             raise ValueError(
                 f"timeout_seconds must be positive, got {timeout_seconds}"
@@ -107,6 +104,22 @@ class ClusterConfig:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         return cls.from_dict(raw)
+
+    @staticmethod
+    def _validate_ack_required(ack_required: int, followers: list[Follower]) -> None:
+        if not 0 <= ack_required <= len(followers):
+            raise ValueError(
+                f"ack_required ({ack_required}) must be between 0 and "
+                f"the number of followers ({len(followers)})"
+            )
+
+    def with_ack_required(self, ack_required: int) -> "ClusterConfig":
+        """Return a copy of this config with ack_required overridden,
+        e.g. by a --ack-required CLI flag. Validated the same way as
+        the YAML-sourced value (0 to len(followers)).
+        """
+        self._validate_ack_required(ack_required, self.followers)
+        return dataclasses.replace(self, ack_required=ack_required)
 
 
 # --- Replication ------------------------------------------------------
@@ -283,13 +296,31 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"default {DEFAULT_CONFIG_PATH})."
         ),
     )
+    parser.add_argument(
+        "--ack-required",
+        type=int,
+        default=None,
+        help=(
+            "Number of follower acks required before a write succeeds, "
+            "overriding ack_required from the cluster config YAML. Must "
+            "be between 0 and the number of followers. Defaults to the "
+            "value in the config YAML."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _resolve_config(args: argparse.Namespace) -> ClusterConfig:
+    config = ClusterConfig.from_yaml(args.config)
+    if args.ack_required is not None:
+        config = config.with_ack_required(args.ack_required)
+    return config
 
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     args = _parse_args(argv)
-    config = ClusterConfig.from_yaml(args.config)
+    config = _resolve_config(args)
     app = build_app(args.node_id, config)
     uvicorn.run(app, host=args.host, port=args.port)
 
