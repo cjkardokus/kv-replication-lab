@@ -48,7 +48,13 @@ from fastapi import FastAPI
 from common.server import ReplicateResponse, create_app
 from common.storage import KVStore
 from leader_follower.follower import build_app as build_follower_app
-from leader_follower.leader import ClusterConfig, Follower, build_app as build_leader_app
+from leader_follower.leader import (
+    ClusterConfig,
+    Follower,
+    _parse_args,
+    _resolve_config,
+    build_app as build_leader_app,
+)
 
 
 # --- Real-server test harness --------------------------------------------
@@ -331,3 +337,78 @@ def test_repo_cluster_config_file_parses():
     assert len(config.followers) >= 1
     assert 0 <= config.ack_required <= len(config.followers)
     assert config.timeout_seconds > 0
+
+
+# --- --ack-required CLI override ------------------------------------------
+
+
+def _write_cluster_config(
+    tmp_path, *, followers: int = 2, ack_required: int = 1, timeout_seconds: float = 2.0
+):
+    """Write a minimal cluster config YAML with `followers` followers
+    and return its path, for exercising --config/--ack-required
+    resolution without touching the checked-in config file.
+    """
+    lines = ["followers:"]
+    for i in range(followers):
+        lines.append(f"  - host: 127.0.0.1\n    port: {9000 + i}")
+    lines.append(f"ack_required: {ack_required}")
+    lines.append(f"timeout_seconds: {timeout_seconds}")
+    path = tmp_path / "cluster.yaml"
+    path.write_text("\n".join(lines))
+    return path
+
+
+def test_ack_required_cli_flag_overrides_yaml_value(tmp_path):
+    config_path = _write_cluster_config(tmp_path, followers=2, ack_required=1)
+
+    args = _parse_args(
+        ["--node-id", "leader-1", "--config", str(config_path), "--ack-required", "2"]
+    )
+    config = _resolve_config(args)
+
+    assert config.ack_required == 2
+
+
+def test_ack_required_omitted_uses_yaml_default(tmp_path):
+    config_path = _write_cluster_config(tmp_path, followers=2, ack_required=1)
+
+    args = _parse_args(["--node-id", "leader-1", "--config", str(config_path)])
+    config = _resolve_config(args)
+
+    # No --ack-required given -- behavior unchanged, YAML value used as-is.
+    assert config.ack_required == 1
+
+
+@pytest.mark.parametrize("ack_required", [-1, 3])
+def test_ack_required_cli_flag_out_of_range_is_rejected(tmp_path, ack_required):
+    # YAML's own value (1) is in-range; it's the CLI override that's
+    # out of bounds for 2 followers here.
+    config_path = _write_cluster_config(tmp_path, followers=2, ack_required=1)
+
+    args = _parse_args(
+        [
+            "--node-id",
+            "leader-1",
+            "--config",
+            str(config_path),
+            "--ack-required",
+            str(ack_required),
+        ]
+    )
+    with pytest.raises(ValueError):
+        _resolve_config(args)
+
+
+@pytest.mark.parametrize("ack_required", [-1, 3])
+def test_ack_required_yaml_out_of_range_still_rejected_without_cli_flag(
+    tmp_path, ack_required
+):
+    # No --ack-required override at all -- the out-of-range value comes
+    # straight from the YAML, same validation path as before this flag
+    # existed.
+    config_path = _write_cluster_config(tmp_path, followers=2, ack_required=ack_required)
+
+    args = _parse_args(["--node-id", "leader-1", "--config", str(config_path)])
+    with pytest.raises(ValueError):
+        _resolve_config(args)
