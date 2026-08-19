@@ -12,6 +12,12 @@ followers:
     port: 8001
   - host: 127.0.0.1
     port: 8002
+  - host: 127.0.0.1
+    port: 8003
+  - host: 127.0.0.1
+    port: 8004
+  - host: 127.0.0.1
+    port: 8005
 
 # Number of follower acks the leader waits for before responding success
 # to the client. Must be between 0 and len(followers):
@@ -23,7 +29,7 @@ followers:
 # Followers that ack after the client has already gotten a response
 # (because ack_required was reached, or because the timeout below fired)
 # still get the write applied -- they just aren't waited on.
-ack_required: 1
+ack_required: 2
 
 # Max seconds the leader waits for `ack_required` acks before giving up
 # and failing the write back to the client (fail loudly, no partial
