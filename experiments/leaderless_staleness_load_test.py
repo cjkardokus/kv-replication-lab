@@ -38,6 +38,19 @@ Approach
   coordinator whose quorum read is missing the key, or returns an older
   timestamp than the snapshot, is stale; equal or newer is not (it may
   simply reflect a write this script hasn't caught up to itself).
+- Every request is also classified as succeeded or failed, independent
+  of staleness: a non-2xx response (status code recorded, including a
+  503 when a coordinator can't reach quorum in time), a timeout, or a
+  connection error all count as a failure rather than a stale
+  read/write. A failed write never updates the source-of-truth dict
+  (nothing durably happened to record); a failed read is never counted
+  as a stale-read comparison (it never got a value back to compare).
+  Failure counts are broken out by type and by read/write in the
+  summary, and logged to a separate JSONL file from the stale-read log
+  (see OUTPUT_LOG_PATH / FAILURE_LOG_PATH) -- staleness and failure are
+  different questions (did a read see old data vs. did a request work
+  at all), so keeping them in separate files means a consumer of
+  either one doesn't have to filter out the other's fields.
 
 With default_w=3 and default_r=3 against a 5-node cluster, W+R > N, so
 every read quorum is guaranteed to overlap every write quorum by at
@@ -60,6 +73,7 @@ import json
 import random
 import statistics
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -78,6 +92,7 @@ REQUEST_TIMEOUT = 5.0
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_LOG_PATH = OUTPUT_DIR / "leaderless_staleness_log.jsonl"
+FAILURE_LOG_PATH = OUTPUT_DIR / "leaderless_staleness_failures_log.jsonl"
 
 KEYS = [f"key_{i}" for i in range(NUM_KEYS)]
 
@@ -165,6 +180,18 @@ class Stats:
     stale_reads: int = 0
     stale_events: list[dict[str, Any]] = field(default_factory=list)
 
+    # A "failure" is a read or write that never got a valid response at
+    # all -- a non-2xx status, a timeout, or a connection error -- as
+    # opposed to a stale read, which did get a response, just an
+    # outdated one. Counted and logged separately: a failed write never
+    # updates source_of_truth (nothing durably happened to record), and
+    # a failed read is never counted as a stale-read comparison (there's
+    # no value to compare).
+    failed_reads: int = 0
+    failed_writes: int = 0
+    failure_counts: Counter[tuple[str, str]] = field(default_factory=Counter)
+    failure_events: list[dict[str, Any]] = field(default_factory=list)
+
     def merge(self, other: "Stats") -> None:
         self.total_requests += other.total_requests
         self.total_reads += other.total_reads
@@ -172,6 +199,10 @@ class Stats:
         self.comparable_reads += other.comparable_reads
         self.stale_reads += other.stale_reads
         self.stale_events.extend(other.stale_events)
+        self.failed_reads += other.failed_reads
+        self.failed_writes += other.failed_writes
+        self.failure_counts.update(other.failure_counts)
+        self.failure_events.extend(other.failure_events)
 
 
 # --- Worker logic -------------------------------------------------------
@@ -192,6 +223,50 @@ async def discover_node_ids(
         resp.raise_for_status()
         node_ids[node] = resp.json()["node_id"]
     return node_ids
+
+
+def _classify_exception(exc: httpx.HTTPError) -> str:
+    """Map an httpx exception to one of the failure-type buckets used
+    in failure_counts/failure_events. httpx.TimeoutException covers
+    connect/read/write/pool timeouts alike; httpx.ConnectError covers
+    "node unreachable/refused". Anything else (e.g. a mid-response
+    ReadError or a RemoteProtocolError) still gets caught and counted
+    -- as "other_error" -- rather than silently escaping
+    classification.
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(exc, httpx.ConnectError):
+        return "connection_error"
+    return "other_error"
+
+
+def _record_failure(
+    stats: Stats,
+    operation: str,
+    failure_type: str,
+    key: str,
+    node_id: str,
+    *,
+    status_code: int | None = None,
+    detail: str | None = None,
+) -> None:
+    if operation == "read":
+        stats.failed_reads += 1
+    else:
+        stats.failed_writes += 1
+    stats.failure_counts[(operation, failure_type)] += 1
+    stats.failure_events.append(
+        {
+            "operation": operation,
+            "failure_type": failure_type,
+            "key": key,
+            "node_id": node_id,
+            "status_code": status_code,
+            "detail": detail,
+            "timestamp": time.time(),
+        }
+    )
 
 
 def _record_stale(
@@ -228,20 +303,33 @@ async def _do_write(
     counter: GlobalCounter,
     source_of_truth: SourceOfTruth,
     rotation: NodeRotation,
+    node_ids: dict[Node, str],
+    stats: Stats,
 ) -> None:
     key = random.choice(KEYS)
     value = await counter.next_value()
     coordinator = await rotation.next_node()
     base_url = f"http://{coordinator.host}:{coordinator.port}"
+    node_id = node_ids.get(coordinator, f"{coordinator.host}:{coordinator.port}")
 
     try:
         resp = await client.put(
             f"{base_url}/kv/{key}", json={"value": value}, timeout=REQUEST_TIMEOUT
         )
-    except httpx.HTTPError:
-        return  # transient failure -- nothing confirmed, nothing to record
+    except httpx.HTTPError as exc:
+        _record_failure(stats, "write", _classify_exception(exc), key, node_id, detail=str(exc))
+        return
 
-    if resp.status_code != 200 or not resp.json().get("applied", False):
+    if resp.status_code != 200:
+        # Includes a 503 when the coordinator couldn't reach its write
+        # quorum in time -- a real failure, distinct from an LWW no-op
+        # below (which is still an HTTP 200).
+        _record_failure(stats, "write", "non_2xx", key, node_id, status_code=resp.status_code)
+        return
+    if not resp.json().get("applied", False):
+        # HTTP succeeded -- this just lost an LWW race to a newer write
+        # already on record. Not a failure, nothing to durably record
+        # from this write specifically.
         return
 
     # Read the entry straight back from the same coordinator to learn
@@ -252,9 +340,21 @@ async def _do_write(
     # truth.
     try:
         entry_resp = await client.get(f"{base_url}/kv/{key}", timeout=REQUEST_TIMEOUT)
-    except httpx.HTTPError:
+    except httpx.HTTPError as exc:
+        _record_failure(
+            stats, "write", _classify_exception(exc), key, node_id, detail=f"readback: {exc}"
+        )
         return
     if entry_resp.status_code != 200:
+        _record_failure(
+            stats,
+            "write",
+            "non_2xx",
+            key,
+            node_id,
+            status_code=entry_resp.status_code,
+            detail="readback",
+        )
         return
 
     body = entry_resp.json()
@@ -274,10 +374,10 @@ async def _do_read(
     expected_before = await source_of_truth.snapshot(key)
     if expected_before is None:
         # No write has completed for this key yet -- nothing to compare
-        # against, so skip rather than counting it stale or not-stale.
+        # against, so skip rather than counting it stale, not-stale, or
+        # a failure. No request is even issued.
         return
 
-    stats.comparable_reads += 1
     node_id = node_ids.get(coordinator, f"{coordinator.host}:{coordinator.port}")
 
     try:
@@ -285,19 +385,26 @@ async def _do_read(
             f"http://{coordinator.host}:{coordinator.port}/kv/{key}",
             timeout=REQUEST_TIMEOUT,
         )
-    except httpx.HTTPError:
-        return  # can't tell whether it's stale or just unreachable right now
+    except httpx.HTTPError as exc:
+        _record_failure(stats, "read", _classify_exception(exc), key, node_id, detail=str(exc))
+        return
+
+    if resp.status_code not in (200, 404):
+        # Includes a 503 when the coordinator couldn't reach its read
+        # quorum in time -- the body won't have `timestamp`, and it's
+        # not a definitive "missing" like a 404 either, so there's
+        # nothing safe to compare. A real failure, not a stale read.
+        _record_failure(stats, "read", "non_2xx", key, node_id, status_code=resp.status_code)
+        return
+
+    # Only now -- once we know the request actually got a valid
+    # response -- does this read count toward the staleness comparison.
+    # A failed request never got a value back, so there's nothing to
+    # compare and it must not be counted here.
+    stats.comparable_reads += 1
 
     if resp.status_code == 404:
         _record_stale(stats, key, node_id, expected_before, actual_timestamp=None)
-        return
-
-    if resp.status_code != 200:
-        # Coordinator failed to reach quorum in time (503) or some
-        # other error (e.g. 422) -- the body won't have `timestamp`,
-        # and it's not a definitive "missing" like a 404 either, so
-        # there's nothing safe to compare or record. Same as an
-        # unreachable node above: skip rather than guess.
         return
 
     body = resp.json()
@@ -324,7 +431,7 @@ async def run_worker(
             await _do_read(client, source_of_truth, rotation, node_ids, stats)
         else:
             stats.total_writes += 1
-            await _do_write(client, counter, source_of_truth, rotation)
+            await _do_write(client, counter, source_of_truth, rotation, node_ids, stats)
     return stats
 
 
@@ -344,11 +451,37 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * fraction
 
 
-def _write_stale_log(events: list[dict[str, Any]]) -> None:
+def _write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_LOG_PATH, "w") as f:
+    with open(path, "w") as f:
         for event in events:
             f.write(json.dumps(event) + "\n")
+
+
+def _print_failure_section(stats: Stats) -> None:
+    """A deliberately loud, fixed-position block -- printed in the same
+    place every run, bordered with '!' the moment any failure exists --
+    so a nonzero failure count can't be missed by skimming past a wall
+    of other numbers. Printed even when there are zero failures, so
+    "no failures" is an explicit, positively-confirmed reading rather
+    than an absence someone has to notice on their own.
+    """
+    total_failures = stats.failed_reads + stats.failed_writes
+    border = "!" * 60 if total_failures else "=" * 60
+
+    print()
+    print(border)
+    print(f"  FAILED REQUESTS: {total_failures}  (reads: {stats.failed_reads}, writes: {stats.failed_writes})")
+    if total_failures:
+        print(border)
+        for (operation, failure_type), count in sorted(stats.failure_counts.items()):
+            print(f"    {operation:<6} {failure_type:<17} {count}")
+        status_codes = Counter(
+            e["status_code"] for e in stats.failure_events if e["failure_type"] == "non_2xx"
+        )
+        if status_codes:
+            print(f"    non-2xx status codes seen: {dict(sorted(status_codes.items()))}")
+    print(border)
 
 
 def _print_summary(stats: Stats, elapsed: float) -> None:
@@ -358,16 +491,21 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
     print(f"total requests sent:  {stats.total_requests}")
     print(f"total reads:          {stats.total_reads}")
     print(f"total writes:         {stats.total_writes}")
+
+    _print_failure_section(stats)
+
+    print()
     print(
         f"comparable reads:     {stats.comparable_reads}  "
-        "(reads with a source-of-truth entry to check against)"
+        "(reads with a source-of-truth entry to check against; failed reads excluded)"
     )
     print(f"stale reads observed: {stats.stale_reads}")
 
     # Staleness rate is reported against comparable reads, not all
     # reads -- reads that had no source-of-truth entry yet (nothing
-    # written for that key so far) were skipped, not counted as
-    # non-stale, so including them would understate the rate.
+    # written for that key so far), or that failed outright, were
+    # skipped rather than counted as non-stale, so including them would
+    # understate the rate.
     rate = 100 * stats.stale_reads / stats.comparable_reads if stats.comparable_reads else 0.0
     print(f"staleness rate:       {rate:.2f}%  (stale / comparable reads)")
 
@@ -385,6 +523,7 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
 
     print()
     print(f"raw stale-read log written to {OUTPUT_LOG_PATH}")
+    print(f"raw failure log written to {FAILURE_LOG_PATH}")
 
 
 # --- Entrypoint -------------------------------------------------------------
@@ -430,7 +569,8 @@ async def main() -> None:
     for result in results:
         stats.merge(result)
 
-    _write_stale_log(stats.stale_events)
+    _write_jsonl(OUTPUT_LOG_PATH, stats.stale_events)
+    _write_jsonl(FAILURE_LOG_PATH, stats.failure_events)
     _print_summary(stats, elapsed)
 
 
