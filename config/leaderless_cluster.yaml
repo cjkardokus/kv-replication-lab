@@ -14,15 +14,15 @@
 # apples-to-apples comparisons between the two strategies.
 nodes:
   - host: 127.0.0.1
-    port: 8001
+    port: 8101
   - host: 127.0.0.1
-    port: 8002
+    port: 8102
   - host: 127.0.0.1
-    port: 8003
+    port: 8103
   - host: 127.0.0.1
-    port: 8004
+    port: 8104
   - host: 127.0.0.1
-    port: 8005
+    port: 8105
 
 # Default read/write quorum sizes, used when a request doesn't supply
 # its own `r`/`w` query parameter. Each must be between 1 and N:
