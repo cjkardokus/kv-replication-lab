@@ -58,10 +58,12 @@ Read path, per GET /kv/{key}:
      responses had an entry for the key at all, that's a real 404, not
      a coordinator error.
   5. Same timeout/fail-loudly policy as writes if R responses aren't
-     collected in time. Unlike a write, a peer read that arrives late
-     has nothing further to do with it, so once R is reached (or the
-     deadline passes) any still-outstanding peer reads are simply
-     cancelled rather than left running in the background.
+     collected in time. A peer read that arrives late has nothing
+     further to do with its result, but once R is reached (or the
+     deadline passes) any still-outstanding peer reads are left to
+     finish in the background rather than cancelled -- see
+     QuorumCoordinator._gather for why cancelling them turned out to be
+     the wrong call.
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ import asyncio
 import dataclasses
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +91,39 @@ from common.storage import KVStore
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/leaderless_cluster.yaml"
+
+# Each node's outbound client fans out to its peers on every coordinated
+# request, so a burst of concurrent client traffic can demand far more
+# simultaneous peer connections than httpx's conservative defaults
+# (100 total / 20 keepalive) provide -- once that pool is exhausted,
+# further peer calls block waiting for a slot and time out
+# (httpx.PoolTimeout), which the coordinator can only see as "peer
+# didn't respond", pushing it toward failing quorum. These are sized
+# well above what this lab's default load (a handful of nodes, ~50
+# concurrent load-test workers) ordinarily needs, as headroom against
+# bursts rather than a promise that no volume of traffic can exhaust
+# them.
+_CLIENT_MAX_CONNECTIONS = 500
+_CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
+
+# Fraction of `timeout_seconds` given to acquiring a connection from
+# the pool, specifically, rather than the connect/read/write phases of
+# a peer call. Keeping this shorter than the full timeout means a call
+# that can't get a connection quickly fails fast and frees the
+# coordinator to fall back on other peers (see
+# QuorumCoordinator._select_fanout_peers) instead of tying up the
+# entire quorum-collection deadline waiting on a pool slot that was
+# never going to free up in time.
+_POOL_TIMEOUT_FRACTION = 0.25
+
+# Extra peers to contact beyond the bare minimum `needed` for a
+# quorum-bounded write or read, so one slow or unreachable peer doesn't
+# by itself force the coordinator to fail quorum. Contacting literally
+# every peer on every request (the previous behavior) gave the same
+# protection but multiplied outbound connection demand by the full
+# peer count regardless of how large a margin was actually useful --
+# see _select_fanout_peers.
+_FANOUT_MARGIN = 1
 
 
 # --- Cluster config --------------------------------------------------
@@ -198,26 +234,54 @@ def _validate_quorum_param(value: int, name: str, n: int) -> None:
 
 
 class QuorumCoordinator:
-    """Fans a write or read out to every peer concurrently, and reports
-    back once enough of them have responded (or the timeout fires).
+    """Fans a write or read out to a subset of peers concurrently, and
+    reports back once enough of them have responded (or the timeout
+    fires).
 
     Shared machinery for both the write path (replicate_write) and the
-    read path (read) -- both boil down to "run one coroutine per peer,
-    collect results that count until `needed` are collected or time runs
-    out". What differs is what "counts" as a response and what happens
-    to peers still outstanding once we stop waiting (see _gather).
+    read path (read) -- both boil down to "run one coroutine per
+    contacted peer, collect results that count until `needed` are
+    collected or time runs out". What differs is what "counts" as a
+    response and what happens to peers still outstanding once we stop
+    waiting (see _gather).
     """
 
     def __init__(
-        self, peers: list[Node], client: httpx.AsyncClient, timeout_seconds: float
+        self,
+        peers: list[Node],
+        client: httpx.AsyncClient,
+        timeout_seconds: float,
+        fanout_margin: int = _FANOUT_MARGIN,
     ) -> None:
         self._peers = peers
         self._client = client
         self._timeout_seconds = timeout_seconds
+        self._fanout_margin = fanout_margin
         # Must keep a strong reference to background write tasks: asyncio
         # only holds a *weak* reference to scheduled tasks, so a task
         # with no other referent can be garbage-collected mid-flight.
         self._background: set[asyncio.Task] = set()
+
+    def _select_fanout_peers(self, needed: int) -> list[Node]:
+        """Peers to actually contact for a quorum-bounded call: `needed`
+        plus a small margin, so one slow or unreachable peer doesn't by
+        itself force the coordinator to fail quorum -- without
+        unconditionally contacting every peer on every request
+        regardless of how many responses are actually required. That
+        unconditional fan-out is what let a burst of concurrent
+        coordinator requests multiply into far more simultaneous
+        outbound connections than any one node's connection pool could
+        sustain (see _CLIENT_MAX_CONNECTIONS).
+
+        Chosen at random each call so contacted-vs-skipped peers don't
+        settle into a fixed pattern that starves some peers of traffic
+        (and thus of a chance to contribute to quorum) while
+        overloading others.
+        """
+        target = min(needed + self._fanout_margin, len(self._peers))
+        if target >= len(self._peers):
+            return self._peers
+        return random.sample(self._peers, target)
 
     async def replicate_write(
         self, key: str, value: Any, timestamp: float, node_id: str, needed: int
@@ -228,7 +292,10 @@ class QuorumCoordinator:
         covers 1 of W). If needed <= 0 (W=1), every peer still gets the
         write -- just not waited on, fired into the background
         immediately -- so a low-W write still lands everywhere
-        eventually instead of only on the coordinator.
+        eventually instead of only on the coordinator. This is about
+        durability, not racing to satisfy `needed`, so every peer is
+        contacted here regardless of fan-out margin -- unlike the
+        quorum-bounded path below.
         """
         payload = {
             "key": key,
@@ -236,23 +303,26 @@ class QuorumCoordinator:
             "timestamp": timestamp,
             "node_id": node_id,
         }
-        coros = [self._replicate_outcome(peer, payload) for peer in self._peers]
 
         if needed <= 0:
-            for coro in coros:
-                task = asyncio.ensure_future(coro)
+            for peer in self._peers:
+                task = asyncio.ensure_future(self._replicate_outcome(peer, payload))
                 self._background.add(task)
                 task.add_done_callback(self._background.discard)
             return 0
 
-        acked = await self._gather(coros, needed, cancel_remaining=False)
+        coros = [
+            self._replicate_outcome(peer, payload)
+            for peer in self._select_fanout_peers(needed)
+        ]
+        acked = await self._gather(coros, needed)
         return len(acked)
 
     async def read(self, key: str, needed: int) -> list[VersionedValue | None]:
-        """Query every peer's local view of `key`; return the responses
-        collected (each element is that peer's entry, or None if the
-        peer responded but has no entry for the key -- see module
-        docstring point 3).
+        """Query a subset of peers' local view of `key`; return the
+        responses collected (each element is that peer's entry, or None
+        if the peer responded but has no entry for the key -- see
+        module docstring point 3).
 
         `needed` is R-1 (the coordinator's own local read already
         covers 1 of R). If needed <= 0 (R=1), no peer is even contacted
@@ -261,50 +331,66 @@ class QuorumCoordinator:
         """
         if needed <= 0:
             return []
-        coros = [self._read_outcome(peer, key) for peer in self._peers]
-        return await self._gather(coros, needed, cancel_remaining=True)
+        coros = [self._read_outcome(peer, key) for peer in self._select_fanout_peers(needed)]
+        return await self._gather(coros, needed)
 
     async def _gather(
-        self,
-        coros: list[Awaitable[tuple[bool, Any]]],
-        needed: int,
-        *,
-        cancel_remaining: bool,
+        self, coros: list[Awaitable[tuple[bool, Any]]], needed: int
     ) -> list[Any]:
         """Run `coros` concurrently; each resolves to (counts, value).
         Collect `value` for every result whose `counts` flag is True,
         stopping once `needed` such results are in or the configured
         timeout elapses, whichever comes first.
 
-        Tasks still outstanding when we stop are either cancelled
-        (cancel_remaining=True -- reads, which have nothing left to do
-        once the quorum is decided) or handed off to run in the
-        background (cancel_remaining=False -- writes, which should
-        still land wherever they can).
+        Peers still outstanding when we stop are handed off to finish
+        in the background rather than cancelled -- including for reads,
+        which have no further use for the result once the quorum is
+        decided. That might read as wasted work, but cancelling an
+        in-flight httpx request turns out not to reliably release its
+        connection: httpcore's cleanup for a request cancelled mid-read
+        (httpcore/_async/connection_pool.py's PoolByteStream.aclose)
+        shields only the stream close itself, not the connection-pool
+        bookkeeping that follows it, so that follow-up can itself be
+        cut short by the same ambient cancellation -- verified against
+        this project's pinned httpx/httpcore versions by hammering a
+        node with concurrent reads and watching its outbound sockets to
+        peers via `ss`: cancelling left sockets stuck in CLOSE-WAIT
+        indefinitely (no drain even after 30s idle), while letting them
+        run to completion in the background did not. A peer read that
+        loses the race still costs a socket and a small amount of peer
+        CPU, but it deterministically finishes and releases cleanly --
+        cheaper than a real leak.
+
+        The hand-off runs in a `finally`, not after the loop, because
+        this coroutine can itself be cancelled mid-`await` -- e.g. the
+        client-facing request it's running under gets cancelled because
+        that client disconnected. Without the `finally`, that
+        cancellation would unwind straight out of the loop, skip the
+        hand-off entirely, and drop the only reference to whatever
+        peer tasks were still `pending` -- the exact leak this method
+        exists to avoid, just reached by a different route.
         """
         pending: set[asyncio.Task] = {asyncio.ensure_future(c) for c in coros}
         collected: list[Any] = []
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout_seconds
 
-        while pending and len(collected) < needed:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                break
-            done, pending = await asyncio.wait(
-                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
-            )
-            if not done:
-                break  # asyncio.wait's own timeout fired
-            for task in done:
-                counts, value = task.result()
-                if counts:
-                    collected.append(value)
-
-        for task in pending:
-            if cancel_remaining:
-                task.cancel()
-            else:
+        try:
+            while pending and len(collected) < needed:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                done, pending = await asyncio.wait(
+                    pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED
+                )
+                if not done:
+                    break  # asyncio.wait's own timeout fired
+                for task in done:
+                    counts, value = task.result()
+                    if counts:
+                        collected.append(value)
+        finally:
+            for task in pending:
                 self._background.add(task)
                 task.add_done_callback(self._background.discard)
 
@@ -386,7 +472,25 @@ def build_app(node_id: str, own_port: int, config: ClusterConfig) -> FastAPI:
     app = create_app(storage, node_id)
     peers = config.peers_excluding(own_port)
     n_total = len(config.nodes)
-    client = httpx.AsyncClient(timeout=config.timeout_seconds)
+    # A bare float for `timeout=` applies to connect/read/write/pool
+    # phases alike, so pool-acquire contention shares the exact same
+    # budget as a slow-but-reachable peer. Give pool-acquire its own,
+    # shorter timeout instead: a call that can't get a connection
+    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) and lets the
+    # coordinator fall back on its fan-out margin rather than tying up
+    # the whole quorum-collection deadline waiting on a slot that was
+    # never going to free up in time.
+    client_timeout = httpx.Timeout(
+        config.timeout_seconds,
+        pool=config.timeout_seconds * _POOL_TIMEOUT_FRACTION,
+    )
+    client = httpx.AsyncClient(
+        timeout=client_timeout,
+        limits=httpx.Limits(
+            max_connections=_CLIENT_MAX_CONNECTIONS,
+            max_keepalive_connections=_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+    )
     coordinator = QuorumCoordinator(peers, client, config.timeout_seconds)
     app.router.add_event_handler("shutdown", client.aclose)
 
