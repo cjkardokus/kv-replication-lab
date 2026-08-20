@@ -292,6 +292,14 @@ async def _do_read(
         _record_stale(stats, key, node_id, expected_before, actual_timestamp=None)
         return
 
+    if resp.status_code != 200:
+        # Coordinator failed to reach quorum in time (503) or some
+        # other error (e.g. 422) -- the body won't have `timestamp`,
+        # and it's not a definitive "missing" like a 404 either, so
+        # there's nothing safe to compare or record. Same as an
+        # unreachable node above: skip rather than guess.
+        return
+
     body = resp.json()
     actual_timestamp = body["timestamp"]
     if actual_timestamp < expected_before.timestamp:
