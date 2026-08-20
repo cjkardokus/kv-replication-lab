@@ -16,8 +16,6 @@ followers:
     port: 8003
   - host: 127.0.0.1
     port: 8004
-  - host: 127.0.0.1
-    port: 8005
 
 # Number of follower acks the leader waits for before responding success
 # to the client. Must be between 0 and len(followers):
