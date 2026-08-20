@@ -1,0 +1,49 @@
+# Leaderless (quorum-based) cluster topology and default R/W quorum sizes.
+#
+# Consumed by leaderless/node.py (ClusterConfig.from_yaml). Unlike the
+# leader-follower cluster config, there's no leader/follower split here
+# -- every node in the cluster runs off this same file, and each one can
+# act as coordinator for any request. A node determines its own peers at
+# startup by excluding itself from the list below, matching on its own
+# configured port (every node runs on 127.0.0.1 locally, so port is the
+# only thing that distinguishes them -- see ClusterConfig.peers_excluding).
+
+# Every node in the cluster, as host:port pairs, self included. N =
+# len(nodes) is the cluster size R and W are bounded by. Matches the
+# 5-node leader-follower cluster (1 leader + 4 followers) for
+# apples-to-apples comparisons between the two strategies.
+nodes:
+  - host: 127.0.0.1
+    port: 8001
+  - host: 127.0.0.1
+    port: 8002
+  - host: 127.0.0.1
+    port: 8003
+  - host: 127.0.0.1
+    port: 8004
+  - host: 127.0.0.1
+    port: 8005
+
+# Default read/write quorum sizes, used when a request doesn't supply
+# its own `r`/`w` query parameter. Each must be between 1 and N:
+#   1 = fastest, weakest consistency -- only the coordinator's own
+#       local read/write is required, nothing is waited on from peers.
+#   N = fully synchronous -- every node must respond/ack.
+# A write always writes locally first (that counts as 1 of W); the
+# remaining W-1 acks are gathered from peers. A read always reads
+# locally first (that counts as 1 of R); the remaining R-1 responses
+# are gathered from peers, and the response with the highest timestamp
+# (LWW, node_id tiebreak) wins.
+#
+# default_w + default_r > N (3 + 3 > 5 here) guarantees every read
+# quorum overlaps every write quorum by at least one node, so a read
+# can never miss the most recent acknowledged write.
+default_w: 3
+default_r: 3
+
+# Max seconds the coordinator waits for the remaining W-1 (write) or
+# R-1 (read) responses before giving up and failing the request back to
+# the client (fail loudly, no partial success). This is also used as
+# the per-request HTTP timeout for calls to peers, so a single
+# unresponsive node can't hang forever.
+timeout_seconds: 2.0
