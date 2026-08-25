@@ -160,6 +160,20 @@ class Stats:
     failure_counts: Counter[tuple[str, str]] = field(default_factory=Counter)
     failure_events: list[dict[str, Any]] = field(default_factory=list)
 
+    @property
+    def total_failures(self) -> int:
+        return self.failed_reads + self.failed_writes
+
+    @property
+    def staleness_rate(self) -> float:
+        """Stale reads as a percentage of *comparable* reads, not all
+        reads -- see _print_summary for why comparable reads is the
+        right denominator.
+        """
+        if not self.comparable_reads:
+            return 0.0
+        return 100 * self.stale_reads / self.comparable_reads
+
     def merge(self, other: "Stats") -> None:
         self.total_requests += other.total_requests
         self.total_reads += other.total_reads
@@ -426,7 +440,7 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def _write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for event in events:
             f.write(json.dumps(event) + "\n")
@@ -440,7 +454,7 @@ def _print_failure_section(stats: Stats) -> None:
     "no failures" is an explicit, positively-confirmed reading rather
     than an absence someone has to notice on their own.
     """
-    total_failures = stats.failed_reads + stats.failed_writes
+    total_failures = stats.total_failures
     border = "!" * 60 if total_failures else "=" * 60
 
     print()
@@ -458,7 +472,12 @@ def _print_failure_section(stats: Stats) -> None:
     print(border)
 
 
-def _print_summary(stats: Stats, elapsed: float) -> None:
+def _print_summary(
+    stats: Stats,
+    elapsed: float,
+    output_log_path: Path = OUTPUT_LOG_PATH,
+    failure_log_path: Path = FAILURE_LOG_PATH,
+) -> None:
     print()
     print("=== staleness load test summary ===")
     print(f"elapsed:              {elapsed:.2f}s")
@@ -480,8 +499,7 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
     # written for that key so far), or that failed outright, were
     # skipped rather than counted as non-stale, so including them would
     # understate the rate.
-    rate = 100 * stats.stale_reads / stats.comparable_reads if stats.comparable_reads else 0.0
-    print(f"staleness rate:       {rate:.2f}%  (stale / comparable reads)")
+    print(f"staleness rate:       {stats.staleness_rate:.2f}%  (stale / comparable reads)")
 
     if stats.stale_events:
         gaps = [e["staleness_gap_ms"] for e in stats.stale_events]
@@ -496,14 +514,45 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
         print("no stale reads observed.")
 
     print()
-    print(f"raw stale-read log written to {OUTPUT_LOG_PATH}")
-    print(f"raw failure log written to {FAILURE_LOG_PATH}")
+    print(f"raw stale-read log written to {output_log_path}")
+    print(f"raw failure log written to {failure_log_path}")
 
 
 # --- Entrypoint -------------------------------------------------------------
 
 
-async def main() -> None:
+@dataclass(frozen=True, slots=True)
+class LoadTestResult:
+    """Structured result of one run_load_test() call, for callers (e.g.
+    experiments/run_comparison.py) that need the numbers to record and
+    rank rather than this script's printed summary.
+    """
+
+    stats: Stats
+    elapsed: float
+
+
+async def run_load_test(
+    *,
+    verbose: bool = True,
+    write_logs: bool = True,
+    output_log_path: Path = OUTPUT_LOG_PATH,
+    failure_log_path: Path = FAILURE_LOG_PATH,
+) -> LoadTestResult:
+    """Run the full staleness load test against an already-running
+    leader-follower cluster (see module docstring) and return the
+    results.
+
+    `verbose` controls whether progress/summary text is printed --
+    a caller driving several runs back-to-back (run_comparison.py)
+    wants its own concise progress line instead of this script's full
+    per-run summary. `write_logs` controls whether the stale-read/
+    failure JSONL logs are written at all; `output_log_path`/
+    `failure_log_path` control *where*, defaulting to
+    OUTPUT_LOG_PATH/FAILURE_LOG_PATH -- a caller running many configs in
+    sequence should override these per config, or each run's logs would
+    silently overwrite the last one's.
+    """
     config = ClusterConfig.from_yaml(CONFIG_PATH)
     followers = config.followers
     if not followers:
@@ -513,7 +562,8 @@ async def main() -> None:
         max_connections=NUM_WORKERS * 2, max_keepalive_connections=NUM_WORKERS * 2
     )
     async with httpx.AsyncClient(limits=limits) as client:
-        print(f"discovering node ids for {len(followers)} followers...")
+        if verbose:
+            print(f"discovering node ids for {len(followers)} followers...")
         follower_node_ids = await discover_node_ids(client, followers)
         leader_node_id = await discover_leader_node_id(client)
 
@@ -524,11 +574,12 @@ async def main() -> None:
         base, remainder = divmod(TOTAL_REQUESTS, NUM_WORKERS)
         worker_loads = [base + (1 if i < remainder else 0) for i in range(NUM_WORKERS)]
 
-        print(
-            f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
-            f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes) "
-            f"against leader {LEADER_URL} and {len(followers)} followers..."
-        )
+        if verbose:
+            print(
+                f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
+                f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes) "
+                f"against leader {LEADER_URL} and {len(followers)} followers..."
+            )
         start = time.time()
         results = await asyncio.gather(
             *(
@@ -550,9 +601,17 @@ async def main() -> None:
     for result in results:
         stats.merge(result)
 
-    _write_jsonl(OUTPUT_LOG_PATH, stats.stale_events)
-    _write_jsonl(FAILURE_LOG_PATH, stats.failure_events)
-    _print_summary(stats, elapsed)
+    if write_logs:
+        _write_jsonl(output_log_path, stats.stale_events)
+        _write_jsonl(failure_log_path, stats.failure_events)
+    if verbose:
+        _print_summary(stats, elapsed, output_log_path, failure_log_path)
+
+    return LoadTestResult(stats=stats, elapsed=elapsed)
+
+
+async def main() -> None:
+    await run_load_test()
 
 
 if __name__ == "__main__":
