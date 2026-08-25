@@ -160,6 +160,42 @@ def _peer_app(node_id: str, storage: KVStore) -> FastAPI:
     return app
 
 
+def _counting_peer_app(node_id: str, storage: KVStore, received: list[str]) -> FastAPI:
+    """A _peer_app whose /internal/replicate and /internal/kv/{key}
+    routes append `node_id` to the shared `received` list before doing
+    their normal job -- lets a test assert exactly how many/which peers
+    were actually contacted for a given quorum-bounded write or read,
+    independent of how many of them ended up counting toward quorum.
+    """
+    app = _peer_app(node_id, storage)
+
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if getattr(route, "path", None) not in ("/internal/replicate", "/internal/kv/{key}")
+    ]
+
+    @app.post("/internal/replicate", response_model=ReplicateResponse)
+    def replicate(body: dict) -> ReplicateResponse:  # type: ignore[type-arg]
+        received.append(node_id)
+        applied = storage.put(
+            body["key"], body["value"], timestamp=body["timestamp"], node_id=body["node_id"]
+        )
+        return ReplicateResponse(applied=applied)
+
+    @app.get("/internal/kv/{key}", response_model=KVResponse)
+    def internal_get_key(key: str) -> KVResponse:
+        received.append(node_id)
+        entry = storage.get(key)
+        if entry is None:
+            raise HTTPException(status_code=404, detail=f"key {key!r} not found")
+        return KVResponse(
+            key=key, value=entry.value, timestamp=entry.timestamp, node_id=entry.node_id,
+        )
+
+    return app
+
+
 def _slow_peer_app(node_id: str, storage: KVStore, *, replicate_delay: float) -> FastAPI:
     """A peer whose /internal/replicate sleeps before applying the
     write, to simulate a slow/unresponsive node for write-timeout tests.
@@ -197,7 +233,7 @@ def test_write_reaches_w_nodes_successfully(cluster):
 
     resp = httpx.put(f"http://{coordinator.host}:{coordinator.port}/kv/k", json={"value": "v1"})
     assert resp.status_code == 200
-    assert resp.json() == {"applied": True}
+    assert resp.json()["applied"] is True
 
     # w=2 is satisfied by the coordinator's own local write plus one
     # peer ack -- poll until at least one peer has the value (both may
@@ -236,6 +272,56 @@ def test_write_times_out_when_w_not_reached(cluster):
     # Failed at roughly the timeout, not after waiting for the slow
     # peers to actually finish.
     assert elapsed < 1.0
+
+
+# --- Fan-out: writes flood, reads are exact (no resilience margin) ----------
+
+
+def test_write_floods_every_peer_regardless_of_w(cluster):
+    """A W-write's ack-*wait* only needs W-1 peer acks, but every peer
+    should still be *contacted* -- durability fan-out is unconditional,
+    independent of W (see QuorumCoordinator.replicate_write). With
+    N=5, w=2 (needed=1), all 4 peers should eventually receive the
+    replicate call, not just the 1 the coordinator waits on.
+    """
+    received: list[str] = []
+    ports = [_free_port() for _ in range(5)]
+    nodes = [Node(host="127.0.0.1", port=p) for p in ports]
+    config = ClusterConfig(nodes=nodes, default_w=2, default_r=2, timeout_seconds=2.0)
+
+    for i, port in enumerate(ports[1:], start=1):
+        cluster(_counting_peer_app(f"peer{i}", KVStore(), received), port)
+    coordinator = cluster(build_app("coord", ports[0], config), ports[0])
+
+    resp = httpx.put(f"http://{coordinator.host}:{coordinator.port}/kv/k", json={"value": "v1"})
+    assert resp.status_code == 200
+
+    deadline = time.time() + 2
+    while len(set(received)) < 4 and time.time() < deadline:
+        time.sleep(0.02)
+    assert set(received) == {"peer1", "peer2", "peer3", "peer4"}
+
+
+def test_read_contacts_exactly_r_minus_one_peers(cluster):
+    """An R-read should touch exactly R nodes total (coordinator plus
+    R-1 peers) -- no extra peers contacted for resilience margin, unlike
+    the write path. N=5, r=2 -> needed=1 peer, no matter how many peers
+    exist.
+    """
+    received: list[str] = []
+    ports = [_free_port() for _ in range(5)]
+    nodes = [Node(host="127.0.0.1", port=p) for p in ports]
+    config = ClusterConfig(nodes=nodes, default_w=2, default_r=2, timeout_seconds=2.0)
+
+    for i, port in enumerate(ports[1:], start=1):
+        cluster(_counting_peer_app(f"peer{i}", KVStore(), received), port)
+    coordinator = cluster(build_app("coord", ports[0], config), ports[0])
+
+    resp = httpx.get(f"http://{coordinator.host}:{coordinator.port}/kv/k", params={"r": 2})
+    # Nobody has this key -- 404 is expected; peer contact count is what
+    # this test actually checks.
+    assert resp.status_code == 404
+    assert len(received) == 1
 
 
 # --- Read quorum tests -------------------------------------------------------

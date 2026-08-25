@@ -348,7 +348,7 @@ def build_app(node_id: str, config: ClusterConfig) -> FastAPI:
                 ),
             )
 
-        return PutResponse(applied=local_applied)
+        return PutResponse(applied=local_applied, timestamp=timestamp)
 
     return app
 

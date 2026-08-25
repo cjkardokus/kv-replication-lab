@@ -167,9 +167,11 @@ def test_write_replicates_identical_version_to_all_followers(cluster):
 
     resp = httpx.put(f"http://{leader.host}:{leader.port}/kv/k", json={"value": "v1"})
     assert resp.status_code == 200
-    assert resp.json() == {"applied": True}
+    put_body = resp.json()
+    assert put_body["applied"] is True
 
     leader_entry = httpx.get(f"http://{leader.host}:{leader.port}/kv/k").json()
+    assert leader_entry["timestamp"] == put_body["timestamp"]
     for follower in (f1, f2):
         entry = httpx.get(f"http://{follower.host}:{follower.port}/kv/k").json()
         # Same timestamp and node_id as the leader's local write -- the

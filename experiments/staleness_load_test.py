@@ -16,14 +16,20 @@ Approach
 - ~50 concurrent asyncio workers fire a 70/30 read/write mix, 10,000
   requests total, against httpx.AsyncClient.
 - Writes go to the leader (PUT /kv/{key}). The leader's PutResponse
-  only reports `applied` -- it doesn't echo back the timestamp it
-  stamped on the write (see common/server.py::PutResponse) -- so on a
-  successful write this script immediately reads the key back from the
-  leader to learn the authoritative (value, timestamp) now on record,
-  and folds that into a shared "source of truth" dict (key -> newest
-  known (value, timestamp), by max timestamp) so concurrent writers
-  completing out of order can't clobber a newer entry with an older
-  one.
+  echoes back the timestamp it stamped on the write (see
+  common/server.py::PutResponse), so a successful write folds its own
+  (value, timestamp) directly into a shared "source of truth" dict (key
+  -> newest known (value, timestamp), by max timestamp) -- no separate
+  readback GET needed. That matters for correctness, not just
+  efficiency: a readback GET reads whatever's *currently* on the leader
+  for that key, which a different, unrelated concurrent write to the
+  same key can have already overwritten, misattributing that other
+  write's value to this one and corrupting ground truth with a value
+  whose own replication status is unknown. Using each write's own
+  response avoids that source of false staleness entirely.
+  source_of_truth still takes the max by timestamp on every update, so
+  concurrent writers completing out of order can't clobber a newer
+  entry with an older one.
 - Reads pick a random key and a random follower, snapshot the source
   of truth for that key *before* issuing the read, then compare the
   follower's response against that snapshot. A follower that's missing
@@ -314,43 +320,22 @@ async def _do_write(
             stats, "write", "non_2xx", key, leader_node_id, status_code=resp.status_code
         )
         return
-    if not resp.json().get("applied", False):
+
+    body = resp.json()
+    if not body.get("applied", False):
         # HTTP succeeded -- this just lost an LWW race to a newer write
         # already on record. Not a failure, nothing to durably record
         # from this write specifically.
         return
 
-    # Read the entry straight back from the leader to learn the
-    # timestamp it actually stamped (see module docstring). If a later
-    # concurrent write to the same key lands first, this may observe
-    # that instead of our own write -- source_of_truth.record() takes
-    # the max by timestamp regardless, so it's still valid ground truth.
-    try:
-        entry_resp = await client.get(f"{LEADER_URL}/kv/{key}", timeout=REQUEST_TIMEOUT)
-    except httpx.HTTPError as exc:
-        _record_failure(
-            stats,
-            "write",
-            _classify_exception(exc),
-            key,
-            leader_node_id,
-            detail=f"readback: {exc}",
-        )
-        return
-    if entry_resp.status_code != 200:
-        _record_failure(
-            stats,
-            "write",
-            "non_2xx",
-            key,
-            leader_node_id,
-            status_code=entry_resp.status_code,
-            detail="readback",
-        )
-        return
-
-    body = entry_resp.json()
-    await source_of_truth.record(key, body["value"], body["timestamp"])
+    # PutResponse echoes back the timestamp this write was stamped with
+    # (see common/server.py::PutResponse) -- no separate readback GET
+    # needed to learn it. That matters beyond just saving a round trip:
+    # a readback GET reads whatever's *currently* on the leader, which a
+    # different, unrelated concurrent write to the same key can have
+    # already overwritten -- misattributing that other write's value to
+    # this one. Using this write's own response avoids that entirely.
+    await source_of_truth.record(key, value, body["timestamp"])
 
 
 async def _do_read(
