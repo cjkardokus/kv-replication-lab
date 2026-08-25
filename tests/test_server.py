@@ -28,11 +28,14 @@ def test_get_missing_key_returns_404(client):
 def test_put_then_get_roundtrips_value(client):
     put_resp = client.put("/kv/k", json={"value": "v1"})
     assert put_resp.status_code == 200
-    assert put_resp.json() == {"applied": True}
+    put_body = put_resp.json()
+    assert put_body["applied"] is True
+    assert isinstance(put_body["timestamp"], float)
 
     get_resp = client.get("/kv/k")
     assert get_resp.status_code == 200
     body = get_resp.json()
+    assert body["timestamp"] == put_body["timestamp"]
     assert body["key"] == "k"
     assert body["value"] == "v1"
     assert body["node_id"] == "node-1"
@@ -54,7 +57,7 @@ def test_put_ignores_client_supplied_timestamp_and_node_id(client):
 def test_put_overwrite_with_newer_write(client):
     client.put("/kv/k", json={"value": "v1"})
     resp = client.put("/kv/k", json={"value": "v2"})
-    assert resp.json() == {"applied": True}
+    assert resp.json()["applied"] is True
     assert client.get("/kv/k").json()["value"] == "v2"
 
 

@@ -90,6 +90,31 @@ DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 # replicate fan-out* (e.g. a semaphore in Replicator), independent of
 # connection-pool size, which is intentionally left undone for now. See
 # docs/results.md for the full ack_required sweep this was confirmed against.
+#
+# _CLIENT_MAX_CONNECTIONS/_CLIENT_MAX_KEEPALIVE_CONNECTIONS below are a
+# single module-level setting applied identically no matter what
+# ack_required this leader is launched with -- there is no per-config
+# pool sizing. That matters because Replicator never cancels a follower
+# it stops waiting on (see Replicator.replicate below), so *every*
+# ack_required value fans a write out to all 4 followers concurrently,
+# not just the ones it waits on -- ack_required only changes how many of
+# those 4 in-flight calls the write path blocks on before returning.
+# Confirmed by isolation-testing this exact pool change at fixed
+# ack_required values (same followers, same load, only the pool setting
+# swapped, leader.py restored after): at ack_required=2, the old
+# unset-Limits default (100/20, pre-dating this pool sizing) measured
+# 0.00% staleness / 0 failures on a reduced run where the current 500/100
+# pool measures 8.87% staleness on the identical run; at ack_required=3,
+# 0.06% (old) vs 4.60% (new). In other words, the small pool wasn't only
+# masking ack_required=0's silent drops -- it was quietly acting as
+# admission control for every ack_required value, at a severity scaled to
+# each one's own concurrency. Enlarging it for ack_required=0 removed
+# that masking everywhere at once, which is why the ack_required=1..4
+# staircase above only became measurable after this fix, not before it.
+# The staircase is still genuine replication lag, not a new bug this
+# introduced -- see the isolation-test evidence above -- but it's worth
+# knowing that connection-pool size is currently one global knob that
+# shapes every config's apparent staleness, not a per-config setting.
 _CLIENT_MAX_CONNECTIONS = 500
 _CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
 
@@ -323,7 +348,7 @@ def build_app(node_id: str, config: ClusterConfig) -> FastAPI:
                 ),
             )
 
-        return PutResponse(applied=local_applied)
+        return PutResponse(applied=local_applied, timestamp=timestamp)
 
     return app
 

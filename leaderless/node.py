@@ -26,13 +26,18 @@ Write path, per PUT /kv/{key}:
      as one of W, regardless of whether storage.put() reports the write
      as applied (a fresh timestamp should always win LWW; see
      common/server.py's PutResponse docstring for the same reasoning).
-  3. Fan the write out to every peer concurrently (not sequentially) via
-     POST /internal/replicate, carrying the *same* timestamp and node_id
-     used for the local write, exactly like leader.py's Replicator.
+  3. Fan the write out to *every* peer concurrently (not sequentially,
+     and not just enough to satisfy W) via POST /internal/replicate,
+     carrying the *same* timestamp and node_id used for the local write,
+     exactly like leader.py's Replicator. Durability is deliberately
+     decoupled from the ack-wait below: every write is attempted
+     everywhere, regardless of W.
   4. `w` (query param, optional) is the total acks required, including
-     the local write from step 2 -- so W-1 more are needed from peers.
-     Defaults to config.default_w if omitted. Must be between 1 and N
-     (the full cluster size, self included).
+     the local write from step 2 -- so W-1 more are needed from peers,
+     and only W-1 of the peers contacted in step 3 are actually waited
+     on; the rest keep running in the background (see step 6). Defaults
+     to config.default_w if omitted. Must be between 1 and N (the full
+     cluster size, self included).
   5. Wait until W total acks are reached or `timeout_seconds` elapses,
      whichever comes first. If W isn't reached in time: fail loudly (an
      error response), never partial success -- same policy as
@@ -41,10 +46,26 @@ Write path, per PUT /kv/{key}:
      applied; their in-flight requests aren't cancelled, just handed off
      to run in the background once we stop waiting on them.
 
+Together, steps 3 and the read path's exactly-R contact below make the
+classic W+R>N overlap guarantee literal, not approximate: at the moment
+a write is acked, at least W nodes (any W, not a specific pre-chosen
+subset -- see step 3) already hold it and can only gain more holders
+over time, never lose one (LWW never regresses); a later read touches
+exactly R nodes. Two subsets of the N nodes of size >=W and R must
+intersect whenever W+R>N, by pigeonhole -- a plain fact about set sizes,
+true regardless of *which* nodes ended up in each subset. When W+R<=N,
+no such intersection is guaranteed, and a disjoint pair is a real,
+reachable outcome, not just a theoretical one -- see
+QuorumCoordinator.replicate_write and .read for exactly how each subset
+is formed.
+
 Read path, per GET /kv/{key}:
   1. This node acts as coordinator. Read its own storage locally first
-     (that's 1 of R) and concurrently query every peer's
-     /internal/kv/{key} for their view of the key.
+     (that's 1 of R) and concurrently query exactly R-1 peers'
+     /internal/kv/{key} for their view of the key -- no more, no fewer:
+     unlike the write path, a read has no durability reason to touch
+     extra peers, so R nodes total (including self) is exactly how many
+     ever get contacted for a given read.
   2. `r` (query param, optional) is the total responses to wait for,
      including the local read. Defaults to config.default_r if omitted.
      Same 1..N bounds as `w`.
@@ -102,51 +123,40 @@ DEFAULT_CONFIG_PATH = "config/leaderless_cluster.yaml"
 # well above what this lab's default load (a handful of nodes, ~50
 # concurrent load-test workers) ordinarily needs, as headroom against
 # bursts rather than a promise that no volume of traffic can exhaust
-# them.
+# them. Writes flood every peer regardless of W (see
+# QuorumCoordinator.replicate_write), so per-write connection demand is
+# the full peer count; reads contact exactly R-1 peers (see
+# QuorumCoordinator.read), so per-read demand scales with R, not peer
+# count. At this lab's cluster size (N=5) neither comes close to
+# exhausting this headroom even at full load.
 _CLIENT_MAX_CONNECTIONS = 500
 _CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
 
 # Fraction of `timeout_seconds` given to acquiring a connection from
 # the pool, specifically, rather than the connect/read/write phases of
 # a peer call. Keeping this shorter than the full timeout means a call
-# that can't get a connection quickly fails fast and frees the
-# coordinator to fall back on other peers (see
-# QuorumCoordinator._select_fanout_peers) instead of tying up the
-# entire quorum-collection deadline waiting on a pool slot that was
-# never going to free up in time.
+# that can't get a connection quickly fails fast, freeing up the rest
+# of the quorum-collection deadline instead of tying it all up waiting
+# on a pool slot that was never going to free up in time.
 _POOL_TIMEOUT_FRACTION = 0.25
 
-# Extra peers to contact beyond the bare minimum `needed` for a
-# quorum-bounded write or read, so one slow or unreachable peer doesn't
-# by itself force the coordinator to fail quorum. Contacting literally
-# every peer on every request (the previous behavior) gave the same
-# protection but multiplied outbound connection demand by the full
-# peer count regardless of how large a margin was actually useful --
-# see _select_fanout_peers.
-#
-# Known side effect at this lab's cluster size (N=5, see
-# config/leaderless_cluster.yaml): this margin pads effective coverage
-# past the nominal W/R values, which can quietly satisfy the classic
-# W+R>N overlap rule even at a config deliberately chosen to sit *on*
-# the boundary (W+R=N) rather than past it. Confirmed via
-# experiments/run_comparison.py for W=2,R=3: with margin=1, a W=2 write
-# durably lands on 3-of-5 nodes (local + 2 contacted peers, since
-# target = min(needed+margin, len(peers)) = min(1+1,4) = 2) and an R=3
-# read's decisive result set also covers 3-of-5 nodes (target =
-# min(2+1,4) = 3, though only the first `needed`=2 responses are used).
-# Two 3-of-5 subsets of a 5-element set must overlap by pigeonhole
-# (3+3-5=1) whenever every contacted peer actually succeeds -- which
-# they did for every write in that run (0 leaderless failures), so the
-# boundary config observed 0.00% staleness instead of the measurable
-# staleness it was meant to demonstrate. This holds regardless of
-# whether coordinator selection is round-robin or random -- it's a
-# property of the *set sizes* the margin produces, not of which specific
-# nodes get picked. See docs/results.md for the full writeup; no change
-# has been made here since the margin is a legitimate resilience
-# feature and shrinking it is a real trade-off, not a strict
-# improvement, left for a deliberate follow-up rather than done
-# incidentally here.
-_FANOUT_MARGIN = 1
+# NOTE: there used to be a _FANOUT_MARGIN constant here -- writes and
+# reads contacted `needed + margin` peers instead of exactly `needed`,
+# as resilience against one slow/unreachable peer without contacting
+# literally everyone. Removed: it made W/R mean something other than
+# their literal definitions (a W-write's real coverage was
+# min(W+margin, N), not W), and at this lab's cluster size it quietly
+# rescued the classic W+R>N overlap rule even for configs deliberately
+# chosen to sit *on* the W+R=N boundary to demonstrate it failing --
+# see git history (leaderless/node.py, this constant) and
+# docs/results.md for the full writeup that led to removing it. Writes
+# now flood every peer unconditionally (see replicate_write) and reads
+# contact exactly `needed` peers (see read/_select_read_peers), so W
+# and R mean literally what they say, at the cost of the resilience
+# margin used to provide: a single slow/unreachable peer among a read's
+# exactly-`needed` selection, or among the acks a write waits on, now
+# fails that request's quorum outright instead of being covered by a
+# spare.
 
 
 # --- Cluster config --------------------------------------------------
@@ -274,37 +284,25 @@ class QuorumCoordinator:
         peers: list[Node],
         client: httpx.AsyncClient,
         timeout_seconds: float,
-        fanout_margin: int = _FANOUT_MARGIN,
     ) -> None:
         self._peers = peers
         self._client = client
         self._timeout_seconds = timeout_seconds
-        self._fanout_margin = fanout_margin
         # Must keep a strong reference to background write tasks: asyncio
         # only holds a *weak* reference to scheduled tasks, so a task
         # with no other referent can be garbage-collected mid-flight.
         self._background: set[asyncio.Task] = set()
 
-    def _select_fanout_peers(self, needed: int) -> list[Node]:
-        """Peers to actually contact for a quorum-bounded call: `needed`
-        plus a small margin, so one slow or unreachable peer doesn't by
-        itself force the coordinator to fail quorum -- without
-        unconditionally contacting every peer on every request
-        regardless of how many responses are actually required. That
-        unconditional fan-out is what let a burst of concurrent
-        coordinator requests multiply into far more simultaneous
-        outbound connections than any one node's connection pool could
-        sustain (see _CLIENT_MAX_CONNECTIONS).
-
-        Chosen at random each call so contacted-vs-skipped peers don't
-        settle into a fixed pattern that starves some peers of traffic
-        (and thus of a chance to contribute to quorum) while
-        overloading others.
+    def _select_read_peers(self, needed: int) -> list[Node]:
+        """Peers to contact for a quorum-bounded read: exactly `needed`,
+        no more -- see module docstring's read-path step 1 for why reads
+        don't get the write path's full-flood treatment. Chosen at
+        random each call so which peers get read traffic doesn't settle
+        into a fixed pattern.
         """
-        target = min(needed + self._fanout_margin, len(self._peers))
-        if target >= len(self._peers):
+        if needed >= len(self._peers):
             return self._peers
-        return random.sample(self._peers, target)
+        return random.sample(self._peers, needed)
 
     async def replicate_write(
         self, key: str, value: Any, timestamp: float, node_id: str, needed: int
@@ -312,13 +310,15 @@ class QuorumCoordinator:
         """Replicate one write to every peer; return how many acked.
 
         `needed` is W-1 (the coordinator's own local write already
-        covers 1 of W). If needed <= 0 (W=1), every peer still gets the
-        write -- just not waited on, fired into the background
-        immediately -- so a low-W write still lands everywhere
-        eventually instead of only on the coordinator. This is about
-        durability, not racing to satisfy `needed`, so every peer is
-        contacted here regardless of fan-out margin -- unlike the
-        quorum-bounded path below.
+        covers 1 of W). Every peer is contacted, unconditionally,
+        regardless of `needed` -- this is about durability, not racing
+        to satisfy `needed`: a write should eventually land everywhere,
+        not just on however many nodes W requires an ack from. `_gather`
+        below only *waits* for `needed` of them (0 is a valid `needed`,
+        for W=1 -- see module docstring write-path step 4); whichever
+        peers are still outstanding once that's satisfied (or once
+        `needed` is already <= 0, meaning none are waited on at all) are
+        handed off to finish in the background, same as ever.
         """
         payload = {
             "key": key,
@@ -326,35 +326,25 @@ class QuorumCoordinator:
             "timestamp": timestamp,
             "node_id": node_id,
         }
-
-        if needed <= 0:
-            for peer in self._peers:
-                task = asyncio.ensure_future(self._replicate_outcome(peer, payload))
-                self._background.add(task)
-                task.add_done_callback(self._background.discard)
-            return 0
-
-        coros = [
-            self._replicate_outcome(peer, payload)
-            for peer in self._select_fanout_peers(needed)
-        ]
+        coros = [self._replicate_outcome(peer, payload) for peer in self._peers]
         acked = await self._gather(coros, needed)
         return len(acked)
 
     async def read(self, key: str, needed: int) -> list[VersionedValue | None]:
-        """Query a subset of peers' local view of `key`; return the
+        """Query exactly `needed` peers' local view of `key`; return the
         responses collected (each element is that peer's entry, or None
         if the peer responded but has no entry for the key -- see
         module docstring point 3).
 
         `needed` is R-1 (the coordinator's own local read already
         covers 1 of R). If needed <= 0 (R=1), no peer is even contacted
-        -- unlike a write, an un-consulted peer here has no "eventual"
-        follow-up to preserve, so there's nothing worth firing off.
+        -- an un-consulted peer here has no "eventual" follow-up to
+        preserve the way an un-waited-on write does, so there's nothing
+        worth firing off.
         """
         if needed <= 0:
             return []
-        coros = [self._read_outcome(peer, key) for peer in self._select_fanout_peers(needed)]
+        coros = [self._read_outcome(peer, key) for peer in self._select_read_peers(needed)]
         return await self._gather(coros, needed)
 
     async def _gather(
@@ -499,9 +489,8 @@ def build_app(node_id: str, own_port: int, config: ClusterConfig) -> FastAPI:
     # phases alike, so pool-acquire contention shares the exact same
     # budget as a slow-but-reachable peer. Give pool-acquire its own,
     # shorter timeout instead: a call that can't get a connection
-    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) and lets the
-    # coordinator fall back on its fan-out margin rather than tying up
-    # the whole quorum-collection deadline waiting on a slot that was
+    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) rather than tying
+    # up the whole quorum-collection deadline waiting on a slot that was
     # never going to free up in time.
     client_timeout = httpx.Timeout(
         config.timeout_seconds,
@@ -564,7 +553,7 @@ def build_app(node_id: str, own_port: int, config: ClusterConfig) -> FastAPI:
                 ),
             )
 
-        return PutResponse(applied=local_applied)
+        return PutResponse(applied=local_applied, timestamp=timestamp)
 
     @app.get("/kv/{key}", response_model=KVResponse)
     async def get_key_coordinator(

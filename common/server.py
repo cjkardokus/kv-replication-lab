@@ -49,9 +49,20 @@ class PutResponse(BaseModel):
     operation this is always True for a client-facing PUT, since the
     server always stamps a fresh timestamp -- but storage.put() is LWW
     under the hood, so we surface the real result rather than assuming.
+
+    `timestamp` is the timestamp this write was stamped with, echoed
+    back so a caller that needs to know it (e.g. a load test recording
+    ground truth for later staleness comparisons) doesn't have to
+    immediately re-GET the key to find out -- a separate GET can race a
+    *different*, unrelated concurrent write to the same key and pick up
+    its value instead, misattributing it to this write. Always present,
+    even when `applied` is False: it's still this write's own
+    timestamp, just one that lost the LWW race to something already
+    newer.
     """
 
     applied: bool
+    timestamp: float
 
 
 class KVResponse(BaseModel):
@@ -128,8 +139,9 @@ def create_app(storage: KVStore, node_id: str) -> FastAPI:
         logger.info("method=%s path=%s key=%s", request.method, request.url.path, key)
         # Server generates the timestamp and stamps its own node_id --
         # never trust a client to supply these for a fresh write.
-        applied = storage.put(key, body.value, timestamp=time.time(), node_id=node_id)
-        return PutResponse(applied=applied)
+        timestamp = time.time()
+        applied = storage.put(key, body.value, timestamp=timestamp, node_id=node_id)
+        return PutResponse(applied=applied, timestamp=timestamp)
 
     @app.delete("/kv/{key}", response_model=DeleteResponse)
     def delete_key(key: str, request: Request) -> DeleteResponse:

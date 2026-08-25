@@ -18,26 +18,39 @@ Approach
   and traceable to exactly one write.
 - ~50 concurrent asyncio workers fire a 70/30 read/write mix, 10,000
   requests total, against httpx.AsyncClient.
-- Coordinator selection is round robin: a shared, lock-protected index
-  cycles through the 5 nodes from config/leaderless_cluster.yaml, so
-  each outgoing request (read or write) targets the next node in turn
-  as coordinator.
+- Write coordinator selection is round robin: a shared, lock-protected
+  index cycles through the 5 nodes from config/leaderless_cluster.yaml,
+  so each outgoing write targets the next node in turn as coordinator.
+  Read coordinator selection is a fresh, independent `random.choice`
+  over all 5 nodes per read, matching how staleness_load_test.py picks
+  a follower to read from -- round robin for reads would couple which
+  node answers a given read to the same fixed cycle every write also
+  goes through, a test-harness artifact with no equivalent on the
+  leader-follower side, worth removing so any remaining difference
+  between the two benchmarks' results reflects the systems, not the
+  harnesses measuring them.
 - Writes PUT to the chosen coordinator, using the cluster's default_w
   (no `w` override -- this run tests at default_w=3). The coordinator's
-  PutResponse only reports `applied`, not the timestamp it stamped (see
-  common/server.py::PutResponse), so on a successful write this script
-  immediately reads the key back from the *same* coordinator to learn
-  the authoritative (value, timestamp) it just wrote, and folds that
-  into a shared "source of truth" dict (key -> newest known (value,
-  timestamp), by max timestamp) so concurrent writers completing out of
-  order can't clobber a newer entry with an older one.
-- Reads pick a random key and the next round-robin coordinator, snapshot
-  the source of truth for that key *before* issuing the read, then GET
-  from that coordinator (using the cluster's default_r, no override --
-  default_r=3) and compare its response against that snapshot. A
-  coordinator whose quorum read is missing the key, or returns an older
-  timestamp than the snapshot, is stale; equal or newer is not (it may
-  simply reflect a write this script hasn't caught up to itself).
+  PutResponse echoes back the timestamp it stamped (see
+  common/server.py::PutResponse), so a successful write folds its own
+  (value, timestamp) directly into a shared "source of truth" dict (key
+  -> newest known (value, timestamp), by max timestamp) -- no separate
+  readback GET needed. That matters for correctness, not just
+  efficiency: a readback GET reads whatever's *currently* on that
+  coordinator for that key, which a different, unrelated concurrent
+  write to the same key can have already overwritten. Using each
+  write's own response avoids that source of false staleness entirely.
+  source_of_truth still takes the max by timestamp on every update, so
+  concurrent writers completing out of order can't clobber a newer
+  entry with an older one.
+- Reads pick a random key and an independently random coordinator (see
+  above), snapshot the source of truth for that key *before* issuing
+  the read, then GET from that coordinator (using the cluster's
+  default_r, no override -- default_r=3) and compare its response
+  against that snapshot. A coordinator whose quorum read is missing the
+  key, or returns an older timestamp than the snapshot, is stale; equal
+  or newer is not (it may simply reflect a write this script hasn't
+  caught up to itself).
 - Every request is also classified as succeeded or failed, independent
   of staleness: a non-2xx response (status code recorded, including a
   503 when a coordinator can't reach quorum in time), a timeout, or a
@@ -90,26 +103,33 @@ TOTAL_REQUESTS = 10_000
 READ_FRACTION = 0.7  # ~70% reads, ~30% writes
 REQUEST_TIMEOUT = 5.0
 
-# Known limitation at these settings: with W=1 (weakest write quorum),
-# QuorumCoordinator.replicate_write's needed<=0 branch fans a write out
-# to *every* node in the background unconditionally, regardless of
-# _FANOUT_MARGIN -- so a W=1 write is durable everywhere within a few
-# milliseconds on localhost. At NUM_KEYS=100 and this run's throughput
-# (~300-400 req/s, i.e. ~3-4 req/s per key), the average gap between two
-# requests touching the *same* key is ~250-330ms -- 50-100x longer than
-# that replication window -- so a read essentially never lands on a key
-# before its last write has already propagated everywhere. Confirmed via
-# experiments/run_comparison.py: W=1,R=1 (and every other config) showed
-# 0.00% staleness in a real run. This is a local-testing artifact, not a
-# guarantee of the protocol -- the same category of blind spot the
-# top-level README already documents for clock skew ("invisible in local
-# testing... becomes real once nodes run on separate EC2 instances").
-# Reproducing it locally would need either injecting artificial
-# per-replica latency (test-only fakery in production replication code)
-# or shrinking NUM_KEYS enough to manufacture heavy hot-key contention,
-# neither of which is free -- left undone for now; expected to become
-# observable once this project reaches the planned multi-machine phase.
-# See docs/results.md for the full writeup.
+# Known limitation at these settings, for *every* W value, not just
+# W=1: QuorumCoordinator.replicate_write fans a write out to *every*
+# node in the background unconditionally, regardless of W -- only the
+# ack-*wait* is bounded by W, not who gets contacted (see
+# leaderless/node.py's module docstring) -- so any write is durable
+# everywhere within a few milliseconds on localhost, independent of
+# nominal W. At NUM_KEYS=100 and this run's throughput (~300-400 req/s,
+# i.e. ~3-4 req/s per key), the average gap between two requests
+# touching the *same* key is ~250-330ms -- 50-100x longer than that
+# replication window -- so a read essentially never lands on a key
+# before its last write has already propagated everywhere, whether or
+# not that config's W/R combination is actually guaranteed to prevent
+# it. Confirmed via experiments/run_comparison.py: every config,
+# including W=2,R=3 (genuinely not guaranteed: 2+3=5, not >5) showed
+# 0.00% staleness in a real run, even with QuorumCoordinator now
+# contacting exactly the peers each config's literal W/R implies (no
+# margin padding coverage -- see leaderless/node.py's removed
+# _FANOUT_MARGIN in git history). This is a local-testing artifact, not
+# a guarantee of the protocol -- the same category of blind spot the
+# top-level README already documents for clock skew ("invisible in
+# local testing... becomes real once nodes run on separate EC2
+# instances"). Reproducing it locally would need either injecting
+# artificial per-replica latency (test-only fakery in production
+# replication code) or shrinking NUM_KEYS enough to manufacture heavy
+# hot-key contention, neither of which is free -- left undone for now;
+# expected to become observable once this project reaches the planned
+# multi-machine phase. See docs/results.md for the full writeup.
 
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_LOG_PATH = OUTPUT_DIR / "leaderless_staleness_log.jsonl"
@@ -370,56 +390,37 @@ async def _do_write(
         # below (which is still an HTTP 200).
         _record_failure(stats, "write", "non_2xx", key, node_id, status_code=resp.status_code)
         return
-    if not resp.json().get("applied", False):
+
+    body = resp.json()
+    if not body.get("applied", False):
         # HTTP succeeded -- this just lost an LWW race to a newer write
         # already on record. Not a failure, nothing to durably record
         # from this write specifically.
         return
 
-    # Read the entry straight back from the same coordinator to learn
-    # the timestamp it actually stamped (see module docstring). If a
-    # later concurrent write to the same key lands first, this may
-    # observe that instead of our own write -- source_of_truth.record()
-    # takes the max by timestamp regardless, so it's still valid ground
-    # truth. Pinned to r=1 (local-only) regardless of the `r` under
-    # test: this is just bookkeeping to learn our own coordinator's
-    # freshest local value, not part of what's being measured, so there's
-    # no reason to pay for a wider quorum fan-out here.
-    try:
-        entry_resp = await client.get(
-            f"{base_url}/kv/{key}", params={"r": 1}, timeout=REQUEST_TIMEOUT
-        )
-    except httpx.HTTPError as exc:
-        _record_failure(
-            stats, "write", _classify_exception(exc), key, node_id, detail=f"readback: {exc}"
-        )
-        return
-    if entry_resp.status_code != 200:
-        _record_failure(
-            stats,
-            "write",
-            "non_2xx",
-            key,
-            node_id,
-            status_code=entry_resp.status_code,
-            detail="readback",
-        )
-        return
-
-    body = entry_resp.json()
-    await source_of_truth.record(key, body["value"], body["timestamp"])
+    # PutResponse echoes back the timestamp this write was stamped with
+    # (see common/server.py::PutResponse) -- no separate readback GET
+    # needed. That matters beyond saving a round trip: a readback GET
+    # reads whatever's *currently* on the coordinator for that key,
+    # which a different, unrelated concurrent write to the same key can
+    # have already overwritten -- misattributing that other write's
+    # value to this one. Using this write's own response avoids that
+    # entirely.
+    await source_of_truth.record(key, value, body["timestamp"])
 
 
 async def _do_read(
     client: httpx.AsyncClient,
     source_of_truth: SourceOfTruth,
-    rotation: NodeRotation,
+    nodes: list[Node],
     node_ids: dict[Node, str],
     stats: Stats,
     r: int | None = None,
 ) -> None:
     key = random.choice(KEYS)
-    coordinator = await rotation.next_node()
+    # Independent random draw per read, not the shared write rotation --
+    # see module docstring.
+    coordinator = random.choice(nodes)
 
     expected_before = await source_of_truth.snapshot(key)
     if expected_before is None:
@@ -476,6 +477,7 @@ async def run_worker(
     counter: GlobalCounter,
     source_of_truth: SourceOfTruth,
     rotation: NodeRotation,
+    nodes: list[Node],
     node_ids: dict[Node, str],
     w: int | None = None,
     r: int | None = None,
@@ -485,7 +487,7 @@ async def run_worker(
         stats.total_requests += 1
         if random.random() < READ_FRACTION:
             stats.total_reads += 1
-            await _do_read(client, source_of_truth, rotation, node_ids, stats, r)
+            await _do_read(client, source_of_truth, nodes, node_ids, stats, r)
         else:
             stats.total_writes += 1
             await _do_write(client, counter, source_of_truth, rotation, node_ids, stats, w)
@@ -658,7 +660,7 @@ async def run_load_test(
         start = time.time()
         results = await asyncio.gather(
             *(
-                run_worker(load, client, counter, source_of_truth, rotation, node_ids, w, r)
+                run_worker(load, client, counter, source_of_truth, rotation, nodes, node_ids, w, r)
                 for load in worker_loads
             )
         )
