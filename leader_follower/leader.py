@@ -51,6 +51,53 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 
+# At ack_required>=1 the write path awaits at least one follower ack
+# before returning, which naturally throttles how many replicate()
+# calls can be in flight at once (bounded by however many client writes
+# are concurrently in flight, e.g. ~50 under this lab's load test). At
+# ack_required=0 (fire-and-forget) there is no such backpressure --
+# every write immediately fires len(followers) background tasks with
+# nothing waiting on them, so a sustained burst of writes can demand far
+# more simultaneous outbound connections than httpx's conservative
+# defaults (100 total / 20 keepalive) provide. Once that pool was
+# exhausted, a queued replicate call used to wait out the full client
+# timeout for a connection slot and then give up (httpx.PoolTimeout) --
+# a write the client was told succeeded never actually reached that
+# follower at all. Sizing the pool up (below) fixes exactly that: with
+# ack_required 1..4, replicate delivery is 100% and the leader logs zero
+# exceptions, confirmed via experiments/run_comparison.py.
+#
+# ack_required=0 is a different story, and *raising this pool size does
+# not fix it* -- it only relocates where it breaks. The original small
+# pool was accidentally acting as admission control: it dropped excess
+# replicate attempts fast (silent data loss -- ~87% of writes never
+# reached any follower) but kept followers and the leader itself
+# responsive (0 client-visible failures). With the pool enlarged,
+# more concurrent replicate attempts actually reach the followers, which
+# have no concurrency limiting of their own (plain uvicorn, one event
+# loop) -- under this lab's sustained, unthrottled load test they slow
+# down, which keeps each replicate() call alive longer, which lets
+# ack_required=0's backpressure-free write path pile up yet more
+# concurrent background tasks before the old ones drain. That feedback
+# loop eventually starves the *leader's own* single-threaded event loop:
+# at full load-test scale this was observed causing 2,291 client-visible
+# timeouts on the leader's plain client-facing PUT /kv/{key} -- an
+# in-memory dict write with no I/O of its own -- plus a ~3x elapsed-time
+# blowup versus every other ack_required value. ack_required=0 having no
+# backpressure is real and expected (see config/leader_follower_cluster.yaml);
+# this is a demonstration of that, not a bug to chase with more pool
+# tuning -- fixing it for real would mean bounding *concurrent in-flight
+# replicate fan-out* (e.g. a semaphore in Replicator), independent of
+# connection-pool size, which is intentionally left undone for now. See
+# docs/results.md for the full ack_required sweep this was confirmed against.
+_CLIENT_MAX_CONNECTIONS = 500
+_CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
+
+# Fraction of `timeout_seconds` given to acquiring a connection from
+# the pool, specifically, rather than the connect/read/write phases of
+# a replicate call -- see build_app().
+_POOL_TIMEOUT_FRACTION = 0.25
+
 
 # --- Cluster config --------------------------------------------------
 
@@ -219,7 +266,24 @@ def build_app(node_id: str, config: ClusterConfig) -> FastAPI:
     """
     storage = KVStore()
     app = create_app(storage, node_id)
-    client = httpx.AsyncClient(timeout=config.timeout_seconds)
+    # A bare float for `timeout=` applies to connect/read/write/pool
+    # phases alike, so pool-acquire contention shares the exact same
+    # budget as a slow-but-reachable follower. Give pool-acquire its own,
+    # shorter timeout instead: a call that can't get a connection
+    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) rather than tying
+    # up the whole ack-collection deadline waiting on a slot that was
+    # never going to free up in time.
+    client_timeout = httpx.Timeout(
+        config.timeout_seconds,
+        pool=config.timeout_seconds * _POOL_TIMEOUT_FRACTION,
+    )
+    client = httpx.AsyncClient(
+        timeout=client_timeout,
+        limits=httpx.Limits(
+            max_connections=_CLIENT_MAX_CONNECTIONS,
+            max_keepalive_connections=_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
+        ),
+    )
     replicator = Replicator(config, client)
     app.router.add_event_handler("shutdown", client.aclose)
 
