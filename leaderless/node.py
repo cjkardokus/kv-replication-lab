@@ -123,6 +123,29 @@ _POOL_TIMEOUT_FRACTION = 0.25
 # protection but multiplied outbound connection demand by the full
 # peer count regardless of how large a margin was actually useful --
 # see _select_fanout_peers.
+#
+# Known side effect at this lab's cluster size (N=5, see
+# config/leaderless_cluster.yaml): this margin pads effective coverage
+# past the nominal W/R values, which can quietly satisfy the classic
+# W+R>N overlap rule even at a config deliberately chosen to sit *on*
+# the boundary (W+R=N) rather than past it. Confirmed via
+# experiments/run_comparison.py for W=2,R=3: with margin=1, a W=2 write
+# durably lands on 3-of-5 nodes (local + 2 contacted peers, since
+# target = min(needed+margin, len(peers)) = min(1+1,4) = 2) and an R=3
+# read's decisive result set also covers 3-of-5 nodes (target =
+# min(2+1,4) = 3, though only the first `needed`=2 responses are used).
+# Two 3-of-5 subsets of a 5-element set must overlap by pigeonhole
+# (3+3-5=1) whenever every contacted peer actually succeeds -- which
+# they did for every write in that run (0 leaderless failures), so the
+# boundary config observed 0.00% staleness instead of the measurable
+# staleness it was meant to demonstrate. This holds regardless of
+# whether coordinator selection is round-robin or random -- it's a
+# property of the *set sizes* the margin produces, not of which specific
+# nodes get picked. See docs/results.md for the full writeup; no change
+# has been made here since the margin is a legitimate resilience
+# feature and shrinking it is a real trade-off, not a strict
+# improvement, left for a deliberate follow-up rather than done
+# incidentally here.
 _FANOUT_MARGIN = 1
 
 

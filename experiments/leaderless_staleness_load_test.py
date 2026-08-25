@@ -90,6 +90,27 @@ TOTAL_REQUESTS = 10_000
 READ_FRACTION = 0.7  # ~70% reads, ~30% writes
 REQUEST_TIMEOUT = 5.0
 
+# Known limitation at these settings: with W=1 (weakest write quorum),
+# QuorumCoordinator.replicate_write's needed<=0 branch fans a write out
+# to *every* node in the background unconditionally, regardless of
+# _FANOUT_MARGIN -- so a W=1 write is durable everywhere within a few
+# milliseconds on localhost. At NUM_KEYS=100 and this run's throughput
+# (~300-400 req/s, i.e. ~3-4 req/s per key), the average gap between two
+# requests touching the *same* key is ~250-330ms -- 50-100x longer than
+# that replication window -- so a read essentially never lands on a key
+# before its last write has already propagated everywhere. Confirmed via
+# experiments/run_comparison.py: W=1,R=1 (and every other config) showed
+# 0.00% staleness in a real run. This is a local-testing artifact, not a
+# guarantee of the protocol -- the same category of blind spot the
+# top-level README already documents for clock skew ("invisible in local
+# testing... becomes real once nodes run on separate EC2 instances").
+# Reproducing it locally would need either injecting artificial
+# per-replica latency (test-only fakery in production replication code)
+# or shrinking NUM_KEYS enough to manufacture heavy hot-key contention,
+# neither of which is free -- left undone for now; expected to become
+# observable once this project reaches the planned multi-machine phase.
+# See docs/results.md for the full writeup.
+
 OUTPUT_DIR = Path(__file__).parent / "output"
 OUTPUT_LOG_PATH = OUTPUT_DIR / "leaderless_staleness_log.jsonl"
 FAILURE_LOG_PATH = OUTPUT_DIR / "leaderless_staleness_failures_log.jsonl"
@@ -191,6 +212,20 @@ class Stats:
     failed_writes: int = 0
     failure_counts: Counter[tuple[str, str]] = field(default_factory=Counter)
     failure_events: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def total_failures(self) -> int:
+        return self.failed_reads + self.failed_writes
+
+    @property
+    def staleness_rate(self) -> float:
+        """Stale reads as a percentage of *comparable* reads, not all
+        reads -- see _print_summary for why comparable reads is the
+        right denominator.
+        """
+        if not self.comparable_reads:
+            return 0.0
+        return 100 * self.stale_reads / self.comparable_reads
 
     def merge(self, other: "Stats") -> None:
         self.total_requests += other.total_requests
@@ -305,6 +340,7 @@ async def _do_write(
     rotation: NodeRotation,
     node_ids: dict[Node, str],
     stats: Stats,
+    w: int | None = None,
 ) -> None:
     key = random.choice(KEYS)
     value = await counter.next_value()
@@ -312,9 +348,17 @@ async def _do_write(
     base_url = f"http://{coordinator.host}:{coordinator.port}"
     node_id = node_ids.get(coordinator, f"{coordinator.host}:{coordinator.port}")
 
+    # `w` overrides the coordinator's default_w for this write only, via
+    # the query param leaderless/node.py's PUT already accepts -- None
+    # leaves the cluster's configured default in place.
+    write_params = {"w": w} if w is not None else None
+
     try:
         resp = await client.put(
-            f"{base_url}/kv/{key}", json={"value": value}, timeout=REQUEST_TIMEOUT
+            f"{base_url}/kv/{key}",
+            json={"value": value},
+            params=write_params,
+            timeout=REQUEST_TIMEOUT,
         )
     except httpx.HTTPError as exc:
         _record_failure(stats, "write", _classify_exception(exc), key, node_id, detail=str(exc))
@@ -337,9 +381,14 @@ async def _do_write(
     # later concurrent write to the same key lands first, this may
     # observe that instead of our own write -- source_of_truth.record()
     # takes the max by timestamp regardless, so it's still valid ground
-    # truth.
+    # truth. Pinned to r=1 (local-only) regardless of the `r` under
+    # test: this is just bookkeeping to learn our own coordinator's
+    # freshest local value, not part of what's being measured, so there's
+    # no reason to pay for a wider quorum fan-out here.
     try:
-        entry_resp = await client.get(f"{base_url}/kv/{key}", timeout=REQUEST_TIMEOUT)
+        entry_resp = await client.get(
+            f"{base_url}/kv/{key}", params={"r": 1}, timeout=REQUEST_TIMEOUT
+        )
     except httpx.HTTPError as exc:
         _record_failure(
             stats, "write", _classify_exception(exc), key, node_id, detail=f"readback: {exc}"
@@ -367,6 +416,7 @@ async def _do_read(
     rotation: NodeRotation,
     node_ids: dict[Node, str],
     stats: Stats,
+    r: int | None = None,
 ) -> None:
     key = random.choice(KEYS)
     coordinator = await rotation.next_node()
@@ -380,9 +430,14 @@ async def _do_read(
 
     node_id = node_ids.get(coordinator, f"{coordinator.host}:{coordinator.port}")
 
+    # `r` overrides the coordinator's default_r for this read only --
+    # None leaves the cluster's configured default in place.
+    read_params = {"r": r} if r is not None else None
+
     try:
         resp = await client.get(
             f"http://{coordinator.host}:{coordinator.port}/kv/{key}",
+            params=read_params,
             timeout=REQUEST_TIMEOUT,
         )
     except httpx.HTTPError as exc:
@@ -422,16 +477,18 @@ async def run_worker(
     source_of_truth: SourceOfTruth,
     rotation: NodeRotation,
     node_ids: dict[Node, str],
+    w: int | None = None,
+    r: int | None = None,
 ) -> Stats:
     stats = Stats()
     for _ in range(num_requests):
         stats.total_requests += 1
         if random.random() < READ_FRACTION:
             stats.total_reads += 1
-            await _do_read(client, source_of_truth, rotation, node_ids, stats)
+            await _do_read(client, source_of_truth, rotation, node_ids, stats, r)
         else:
             stats.total_writes += 1
-            await _do_write(client, counter, source_of_truth, rotation, node_ids, stats)
+            await _do_write(client, counter, source_of_truth, rotation, node_ids, stats, w)
     return stats
 
 
@@ -452,7 +509,7 @@ def _percentile(values: list[float], pct: float) -> float:
 
 
 def _write_jsonl(path: Path, events: list[dict[str, Any]]) -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for event in events:
             f.write(json.dumps(event) + "\n")
@@ -466,7 +523,7 @@ def _print_failure_section(stats: Stats) -> None:
     "no failures" is an explicit, positively-confirmed reading rather
     than an absence someone has to notice on their own.
     """
-    total_failures = stats.failed_reads + stats.failed_writes
+    total_failures = stats.total_failures
     border = "!" * 60 if total_failures else "=" * 60
 
     print()
@@ -484,7 +541,12 @@ def _print_failure_section(stats: Stats) -> None:
     print(border)
 
 
-def _print_summary(stats: Stats, elapsed: float) -> None:
+def _print_summary(
+    stats: Stats,
+    elapsed: float,
+    output_log_path: Path = OUTPUT_LOG_PATH,
+    failure_log_path: Path = FAILURE_LOG_PATH,
+) -> None:
     print()
     print("=== leaderless staleness load test summary ===")
     print(f"elapsed:              {elapsed:.2f}s")
@@ -506,8 +568,7 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
     # written for that key so far), or that failed outright, were
     # skipped rather than counted as non-stale, so including them would
     # understate the rate.
-    rate = 100 * stats.stale_reads / stats.comparable_reads if stats.comparable_reads else 0.0
-    print(f"staleness rate:       {rate:.2f}%  (stale / comparable reads)")
+    print(f"staleness rate:       {stats.staleness_rate:.2f}%  (stale / comparable reads)")
 
     if stats.stale_events:
         gaps = [e["staleness_gap_ms"] for e in stats.stale_events]
@@ -522,14 +583,49 @@ def _print_summary(stats: Stats, elapsed: float) -> None:
         print("no stale reads observed.")
 
     print()
-    print(f"raw stale-read log written to {OUTPUT_LOG_PATH}")
-    print(f"raw failure log written to {FAILURE_LOG_PATH}")
+    print(f"raw stale-read log written to {output_log_path}")
+    print(f"raw failure log written to {failure_log_path}")
 
 
 # --- Entrypoint -------------------------------------------------------------
 
 
-async def main() -> None:
+@dataclass(frozen=True, slots=True)
+class LoadTestResult:
+    """Structured result of one run_load_test() call, for callers (e.g.
+    experiments/run_comparison.py) that need the numbers to record and
+    rank rather than this script's printed summary.
+    """
+
+    stats: Stats
+    elapsed: float
+
+
+async def run_load_test(
+    *,
+    w: int | None = None,
+    r: int | None = None,
+    verbose: bool = True,
+    write_logs: bool = True,
+    output_log_path: Path = OUTPUT_LOG_PATH,
+    failure_log_path: Path = FAILURE_LOG_PATH,
+) -> LoadTestResult:
+    """Run the full staleness load test against an already-running
+    leaderless cluster (see module docstring) and return the results.
+
+    `w`/`r` override the cluster's configured default_w/default_r for
+    every request this run issues, via the same query params
+    leaderless/node.py's PUT/GET already accept -- left as None to use
+    whatever the cluster is configured with. `verbose` controls whether
+    progress/summary text is printed -- a caller driving several runs
+    back-to-back (run_comparison.py) wants its own concise progress line
+    instead of this script's full per-run summary. `write_logs` controls
+    whether the stale-read/failure JSONL logs are written at all;
+    `output_log_path`/`failure_log_path` control *where*, defaulting to
+    OUTPUT_LOG_PATH/FAILURE_LOG_PATH -- a caller running many configs in
+    sequence should override these per config, or each run's logs would
+    silently overwrite the last one's.
+    """
     config = ClusterConfig.from_yaml(CONFIG_PATH)
     nodes = config.nodes
     if not nodes:
@@ -539,7 +635,8 @@ async def main() -> None:
         max_connections=NUM_WORKERS * 2, max_keepalive_connections=NUM_WORKERS * 2
     )
     async with httpx.AsyncClient(limits=limits) as client:
-        print(f"discovering node ids for {len(nodes)} nodes...")
+        if verbose:
+            print(f"discovering node ids for {len(nodes)} nodes...")
         node_ids = await discover_node_ids(client, nodes)
 
         counter = GlobalCounter()
@@ -550,16 +647,18 @@ async def main() -> None:
         base, remainder = divmod(TOTAL_REQUESTS, NUM_WORKERS)
         worker_loads = [base + (1 if i < remainder else 0) for i in range(NUM_WORKERS)]
 
-        print(
-            f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
-            f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes), "
-            f"round-robin coordinator across {len(nodes)} nodes "
-            f"(default_w={config.default_w}, default_r={config.default_r})..."
-        )
+        if verbose:
+            print(
+                f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
+                f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes), "
+                f"round-robin coordinator across {len(nodes)} nodes "
+                f"(w={w if w is not None else config.default_w}, "
+                f"r={r if r is not None else config.default_r})..."
+            )
         start = time.time()
         results = await asyncio.gather(
             *(
-                run_worker(load, client, counter, source_of_truth, rotation, node_ids)
+                run_worker(load, client, counter, source_of_truth, rotation, node_ids, w, r)
                 for load in worker_loads
             )
         )
@@ -569,9 +668,17 @@ async def main() -> None:
     for result in results:
         stats.merge(result)
 
-    _write_jsonl(OUTPUT_LOG_PATH, stats.stale_events)
-    _write_jsonl(FAILURE_LOG_PATH, stats.failure_events)
-    _print_summary(stats, elapsed)
+    if write_logs:
+        _write_jsonl(output_log_path, stats.stale_events)
+        _write_jsonl(failure_log_path, stats.failure_events)
+    if verbose:
+        _print_summary(stats, elapsed, output_log_path, failure_log_path)
+
+    return LoadTestResult(stats=stats, elapsed=elapsed)
+
+
+async def main() -> None:
+    await run_load_test()
 
 
 if __name__ == "__main__":
