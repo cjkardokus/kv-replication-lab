@@ -39,6 +39,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -51,6 +52,8 @@ from leader_follower.follower import build_app as build_follower_app
 from leader_follower.leader import (
     ClusterConfig,
     Follower,
+    _CLIENT_MAX_CONNECTIONS,
+    _CLIENT_MAX_KEEPALIVE_CONNECTIONS,
     _parse_args,
     _resolve_config,
     build_app as build_leader_app,
@@ -288,6 +291,49 @@ def test_unreachable_follower_does_not_block_success_when_others_suffice(cluster
     # ack from the reachable follower should satisfy ack_required well
     # under the 2s timeout.
     assert elapsed < 1.0
+
+
+# --- Connection-pool sizing (module-level, not per-config) -----------------
+
+
+def test_build_app_pool_size_is_module_constant_regardless_of_config():
+    """Guards docs/AUDIT_FINDINGS.md's §1 finding directly: pool sizing
+    (_CLIENT_MAX_CONNECTIONS / _CLIENT_MAX_KEEPALIVE_CONNECTIONS) is a
+    single module-level setting applied identically to the httpx client
+    build_app() constructs, no matter what ack_required (or anything
+    else in ClusterConfig) a given leader is launched with -- there is
+    no per-config pool sizing threaded through ClusterConfig or CLI
+    args. If a future change (e.g. while adding the message-queue
+    replication path) reintroduces per-config pool sizing, this test
+    should fail: every httpx.AsyncClient build_app() constructs, across
+    every ack_required value, must be passed `limits=` equal to the two
+    module constants exactly.
+
+    httpx.AsyncClient itself is mocked (rather than inspecting the real
+    client's private transport/pool internals) so this test asserts on
+    what build_app() actually *requests*, via the public httpx.Limits
+    object it constructs and passes in -- not on httpx/httpcore's
+    internal representation of those limits, which isn't public API and
+    could change independently of this project's own code.
+    """
+    followers = [
+        Follower(host="127.0.0.1", port=9001),
+        Follower(host="127.0.0.1", port=9002),
+        Follower(host="127.0.0.1", port=9003),
+    ]
+
+    with patch("leader_follower.leader.httpx.AsyncClient") as mock_async_client:
+        for ack_required in range(len(followers) + 1):  # 0..3, every valid value
+            config = ClusterConfig(
+                followers=followers, ack_required=ack_required, timeout_seconds=1.0
+            )
+            build_leader_app(f"leader-{ack_required}", config)
+
+    assert mock_async_client.call_count == len(followers) + 1
+    for _, kwargs in mock_async_client.call_args_list:
+        limits = kwargs["limits"]
+        assert limits.max_connections == _CLIENT_MAX_CONNECTIONS
+        assert limits.max_keepalive_connections == _CLIENT_MAX_KEEPALIVE_CONNECTIONS
 
 
 # --- ClusterConfig parsing/validation -------------------------------------

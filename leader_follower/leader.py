@@ -67,29 +67,38 @@ DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 # ack_required 1..4, replicate delivery is 100% and the leader logs zero
 # exceptions, confirmed via experiments/run_comparison.py.
 #
-# ack_required=0 is a different story, and *raising this pool size does
-# not fix it* -- it only relocates where it breaks. The original small
-# pool was accidentally acting as admission control: it dropped excess
-# replicate attempts fast (silent data loss -- ~87% of writes never
-# reached any follower) but kept followers and the leader itself
-# responsive (0 client-visible failures). With the pool enlarged,
-# more concurrent replicate attempts actually reach the followers, which
-# have no concurrency limiting of their own (plain uvicorn, one event
-# loop) -- under this lab's sustained, unthrottled load test they slow
-# down, which keeps each replicate() call alive longer, which lets
-# ack_required=0's backpressure-free write path pile up yet more
-# concurrent background tasks before the old ones drain. That feedback
-# loop eventually starves the *leader's own* single-threaded event loop:
-# at full load-test scale this was observed causing 2,291 client-visible
-# timeouts on the leader's plain client-facing PUT /kv/{key} -- an
-# in-memory dict write with no I/O of its own -- plus a ~3x elapsed-time
-# blowup versus every other ack_required value. ack_required=0 having no
-# backpressure is real and expected (see config/leader_follower_cluster.yaml);
-# this is a demonstration of that, not a bug to chase with more pool
-# tuning -- fixing it for real would mean bounding *concurrent in-flight
-# replicate fan-out* (e.g. a semaphore in Replicator), independent of
-# connection-pool size, which is intentionally left undone for now. See
-# docs/results.md for the full ack_required sweep this was confirmed against.
+# ack_required=0 used to be a different story, and *raising this pool
+# size alone did not fix it* -- it only relocated where it broke. The
+# original small pool was accidentally acting as admission control: it
+# dropped excess replicate attempts fast (silent data loss -- ~87% of
+# writes never reached any follower) but kept followers and the leader
+# itself responsive (0 client-visible failures). With just the pool
+# enlarged and no other change, more concurrent replicate attempts
+# actually reached the followers, which have no concurrency limiting of
+# their own (plain uvicorn, one event loop) -- under this lab's
+# sustained, unthrottled load test they slowed down, which kept each
+# replicate() call alive longer, which let ack_required=0's
+# backpressure-free write path pile up yet more concurrent background
+# tasks before the old ones drained. That feedback loop eventually
+# starved the *leader's own* single-threaded event loop: at full
+# load-test scale (before the fix below) this was observed causing 2,291
+# client-visible timeouts on the leader's plain client-facing
+# PUT /kv/{key} -- an in-memory dict write with no I/O of its own -- plus
+# a ~3x elapsed-time blowup versus every other ack_required value.
+#
+# That was never a connection-pool problem -- it was the total absence
+# of any bound on concurrent in-flight replicate fan-out, independent of
+# pool size. `Replicator` now enforces that bound directly, via
+# `_MAX_CONCURRENT_REPLICATE_CALLS` below (a semaphore around the
+# outbound POST in `Replicator._send`, shared across every write this
+# leader handles, not just one write's own fan-out) -- see that
+# constant's comment for the sizing rationale. The pool size here and
+# the semaphore below do different jobs: the pool exists so a call that
+# *is* admitted never fails to find a connection; the semaphore exists
+# so this leader never admits more concurrent follower calls than it or
+# the followers can absorb, regardless of how fast writes arrive. See
+# docs/results.md for the ack_required sweep this was confirmed against,
+# both before and after the semaphore fix.
 #
 # _CLIENT_MAX_CONNECTIONS/_CLIENT_MAX_KEEPALIVE_CONNECTIONS below are a
 # single module-level setting applied identically no matter what
@@ -110,11 +119,13 @@ DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 # admission control for every ack_required value, at a severity scaled to
 # each one's own concurrency. Enlarging it for ack_required=0 removed
 # that masking everywhere at once, which is why the ack_required=1..4
-# staircase above only became measurable after this fix, not before it.
-# The staircase is still genuine replication lag, not a new bug this
-# introduced -- see the isolation-test evidence above -- but it's worth
-# knowing that connection-pool size is currently one global knob that
-# shapes every config's apparent staleness, not a per-config setting.
+# staircase in docs/results.md only became measurable after this fix,
+# not before it. The staircase is genuine replication lag, not an
+# artifact of this fix or of the _MAX_CONCURRENT_REPLICATE_CALLS
+# semaphore added later -- see the isolation-test evidence above -- but
+# it's worth knowing that connection-pool size is currently one global
+# knob that shapes every config's apparent staleness, not a per-config
+# setting.
 _CLIENT_MAX_CONNECTIONS = 500
 _CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
 
@@ -122,6 +133,39 @@ _CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
 # the pool, specifically, rather than the connect/read/write phases of
 # a replicate call -- see build_app().
 _POOL_TIMEOUT_FRACTION = 0.25
+
+# Bounds how many replicate() calls to followers this leader ever has
+# outstanding *at once, across every write it's handling* -- unlike
+# _CLIENT_MAX_CONNECTIONS above, which only stops an admitted call from
+# failing to find a connection, this is what actually stops
+# ack_required=0 from admitting unbounded concurrent fan-out in the
+# first place (see that constant's comment for the failure mode this
+# closes: an unbounded pile-up of concurrent replicate() calls that
+# eventually starved the leader's own event loop). Enforced in
+# Replicator._send, around the outbound POST only -- not around response
+# parsing, which is pure CPU and never worth gating.
+#
+# Sized well above what a backpressured config (ack_required>=1) could
+# ever demand at this lab's normal load: every ack_required value fans a
+# write out to all len(followers) followers concurrently regardless of
+# what it waits on (see Replicator.replicate), so the true worst case is
+# (concurrent client writes) x (followers), not just concurrent writes.
+# At this lab's load test (NUM_WORKERS=50, so in the extreme all 50
+# could be mid-write at once) x 4 followers = 200 is the theoretical
+# ceiling; realistic concurrent write counts run far lower (~30% of 50
+# workers are writes per the load test's read/write mix, i.e. roughly 15
+# writers x 4 =~ 60 concurrent sends in practice). 256 leaves comfortable
+# headroom above both numbers, so ack_required>=1 configs essentially
+# never see this semaphore as a bottleneck, while still sitting well
+# under _CLIENT_MAX_CONNECTIONS (500) -- so *this* is what actually runs
+# out first for ack_required=0's unthrottled write path, not an
+# httpx.PoolTimeout. That distinction matters: hitting this semaphore
+# just means a coroutine waits in-process for a slot (cheap, no network
+# resource held); hitting the connection pool's own limit means an
+# httpx call that already holds a slot in line for a socket, which is
+# the more expensive, harder-to-recover-from version of the same
+# problem this constant exists to avoid.
+_MAX_CONCURRENT_REPLICATE_CALLS = 256
 
 
 # --- Cluster config --------------------------------------------------
@@ -204,11 +248,27 @@ class Replicator:
     Followers that don't finish in time are *not* cancelled -- they're
     handed off to run in the background so the write still lands
     everywhere eventually, just without blocking the client on it.
+
+    Concurrent in-flight replicate calls, across *every* write this
+    Replicator handles (not just one write's own fan-out to
+    len(followers) followers), are bounded by a shared semaphore sized
+    at _MAX_CONCURRENT_REPLICATE_CALLS -- see that constant for the
+    sizing rationale. This is what gives ack_required=0's
+    fire-and-forget write path real backpressure: with nothing ever
+    awaiting a follower, a sustained burst of writes previously had no
+    limit on how many replicate() calls could pile up concurrently,
+    which under sustained load eventually starved the leader's own event
+    loop (see _CLIENT_MAX_CONNECTIONS' comment for the investigation
+    that found this). ack_required>=1 configs are already naturally
+    throttled by however many client writes are concurrently in flight,
+    so this bound is sized to sit comfortably above that in normal
+    operation and meaningfully engage only for ack_required=0.
     """
 
     def __init__(self, config: ClusterConfig, client: httpx.AsyncClient) -> None:
         self._config = config
         self._client = client
+        self._semaphore = asyncio.Semaphore(_MAX_CONCURRENT_REPLICATE_CALLS)
         # Must keep a strong reference to background tasks: asyncio only
         # holds a *weak* reference to scheduled tasks, so a task with no
         # other referent can be garbage-collected mid-flight.
@@ -263,14 +323,43 @@ class Replicator:
         return acked
 
     async def _send(self, follower: Follower, payload: dict[str, Any]) -> bool:
-        try:
-            resp = await self._client.post(follower.replicate_url, json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError:
-            logger.warning(
-                "replicate to %s failed", follower.replicate_url, exc_info=True
-            )
+        if self._client.is_closed:
+            # The leader is shutting down -- build_app()'s "shutdown"
+            # event handler already closed self._client -- and this call
+            # was still queued behind _semaphore when that happened. The
+            # semaphore is what makes this common enough to guard against
+            # explicitly: it can leave far more replicate() calls queued,
+            # not yet even attempted, at a given moment than pre-semaphore
+            # code ever did (see _MAX_CONCURRENT_REPLICATE_CALLS), so a
+            # shutdown landing mid-flood (e.g. ack_required=0 under
+            # sustained load) can strand a real number of them here.
+            # Treat that the same as any other failed send rather than
+            # letting httpx's "client has been closed" RuntimeError
+            # surface as an unhandled exception in an unawaited
+            # background task (asyncio logs those as "Task exception was
+            # never retrieved" -- alarming, but harmless: nothing was
+            # ever waiting on this task's result by the time it runs).
+            # This narrows, but can't fully close, the race -- the client
+            # could still close between this check and the POST below;
+            # closing that completely would mean draining outstanding
+            # background sends before build_app() closes the client at
+            # all, which is more machinery than this guard needs.
             return False
+        # Only the outbound POST itself is gated by the semaphore -- a
+        # write queued behind it waits in-process for a slot rather than
+        # ever reaching the network, which is the whole point (see
+        # _MAX_CONCURRENT_REPLICATE_CALLS). Response parsing below is
+        # pure CPU on an already-received response, so it's released
+        # before that runs.
+        async with self._semaphore:
+            try:
+                resp = await self._client.post(follower.replicate_url, json=payload)
+                resp.raise_for_status()
+            except httpx.HTTPError:
+                logger.warning(
+                    "replicate to %s failed", follower.replicate_url, exc_info=True
+                )
+                return False
         body = resp.json()
         if not body.get("applied", True):
             logger.warning(
