@@ -23,7 +23,8 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel

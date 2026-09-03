@@ -346,6 +346,11 @@ async def run_worker(
         stats.total_requests += 1
         if item.is_read:
             stats.total_reads += 1
+            # read_target_index is only ever None for a write (see
+            # RequestPlan) -- this branch is a read, so it's always set;
+            # the assert is a narrowing for the type checker as much as
+            # a runtime check.
+            assert item.read_target_index is not None
             coordinator = nodes[item.read_target_index]
             await _do_read(client, source_of_truth, coordinator, node_ids, stats, item.key, r)
         else:

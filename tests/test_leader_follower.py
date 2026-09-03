@@ -59,9 +59,10 @@ from leader_follower.leader import (
     Follower,
     _parse_args,
     _resolve_config,
+)
+from leader_follower.leader import (
     build_app as build_leader_app,
 )
-
 
 # --- Real-server test harness --------------------------------------------
 
@@ -69,7 +70,7 @@ from leader_follower.leader import (
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        return int(s.getsockname()[1])
 
 
 class RunningServer:
@@ -87,7 +88,7 @@ class RunningServer:
         self.server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self.server.run, daemon=True)
 
-    def start(self) -> "RunningServer":
+    def start(self) -> RunningServer:
         self._thread.start()
         deadline = time.time() + 5
         while not self.server.started:

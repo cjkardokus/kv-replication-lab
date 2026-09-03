@@ -53,7 +53,9 @@ def test_lower_timestamp_loses_even_with_higher_node_id():
 def test_versioned_value_is_frozen():
     v = VersionedValue(value="a", timestamp=1.0, node_id="node-1")
     try:
-        v.value = "b"
-        assert False, "expected VersionedValue to be immutable"
+        # Deliberately invalid -- confirms the frozen dataclass rejects
+        # this at runtime, not just at type-check time.
+        v.value = "b"  # type: ignore[misc]
+        raise AssertionError("expected VersionedValue to be immutable")
     except AttributeError:
         pass

@@ -254,7 +254,7 @@ class Stats:
             return 0.0
         return 100 * self.stale_reads / self.comparable_reads
 
-    def merge(self, other: "Stats") -> None:
+    def merge(self, other: Stats) -> None:
         self.total_requests += other.total_requests
         self.total_reads += other.total_reads
         self.total_writes += other.total_writes

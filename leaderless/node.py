@@ -118,9 +118,10 @@ import logging
 import os
 import random
 import time
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable
+from typing import Any
 
 import httpx
 import uvicorn
@@ -211,7 +212,7 @@ class ClusterConfig:
     timeout_seconds: float
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "ClusterConfig":
+    def from_dict(cls, raw: dict[str, Any]) -> ClusterConfig:
         nodes = [
             Node(host=n["host"], port=int(n["port"])) for n in raw.get("nodes", [])
         ]
@@ -234,7 +235,7 @@ class ClusterConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ClusterConfig":
+    def from_yaml(cls, path: str | Path) -> ClusterConfig:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         return cls.from_dict(raw)
@@ -248,7 +249,7 @@ class ClusterConfig:
                 f"nodes ({n})"
             )
 
-    def with_default_w(self, default_w: int) -> "ClusterConfig":
+    def with_default_w(self, default_w: int) -> ClusterConfig:
         """Return a copy of this config with default_w overridden, e.g.
         by a --default-w CLI flag. Validated the same way as the
         YAML-sourced value (1 to N).
@@ -256,7 +257,7 @@ class ClusterConfig:
         self._validate_quorum(default_w, "default_w", self.nodes)
         return dataclasses.replace(self, default_w=default_w)
 
-    def with_default_r(self, default_r: int) -> "ClusterConfig":
+    def with_default_r(self, default_r: int) -> ClusterConfig:
         """Same as with_default_w, but for default_r."""
         self._validate_quorum(default_r, "default_r", self.nodes)
         return dataclasses.replace(self, default_r=default_r)
@@ -312,7 +313,7 @@ class QuorumCoordinator:
         # Must keep a strong reference to background write tasks: asyncio
         # only holds a *weak* reference to scheduled tasks, so a task
         # with no other referent can be garbage-collected mid-flight.
-        self._background: set[asyncio.Task] = set()
+        self._background: set[asyncio.Task[Any]] = set()
 
     def _select_read_peers(self, needed: int) -> list[Node]:
         """Peers to contact for a quorum-bounded read: exactly `needed`,
@@ -369,9 +370,18 @@ class QuorumCoordinator:
         return await self._gather(coros, needed)
 
     async def _gather(
-        self, coros: list[Awaitable[tuple[bool, Any]]], needed: int
+        self, coros: Sequence[Awaitable[tuple[bool, Any]]], needed: int
     ) -> list[Any]:
         """Run `coros` concurrently; each resolves to (counts, value).
+        Takes a Sequence, not a list, specifically so callers passing a
+        list[Awaitable[tuple[bool, VersionedValue | None]]] (a more
+        specific element type than tuple[bool, Any]) type-check --
+        list's own type parameter is invariant, so a list of the more
+        specific type isn't a list of the less specific one as far as
+        the type checker is concerned, even though every real use here
+        is read-only (Sequence is covariant, and _gather never mutates
+        `coros`).
+
         Collect `value` for every result whose `counts` flag is True,
         stopping once `needed` such results are in or the configured
         timeout elapses, whichever comes first.
@@ -404,7 +414,7 @@ class QuorumCoordinator:
         peer tasks were still `pending` -- the exact leak this method
         exists to avoid, just reached by a different route.
         """
-        pending: set[asyncio.Task] = {asyncio.ensure_future(c) for c in coros}
+        pending: set[asyncio.Task[Any]] = {asyncio.ensure_future(c) for c in coros}
         collected: list[Any] = []
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timeout_seconds

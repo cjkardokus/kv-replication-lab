@@ -1,0 +1,34 @@
+[tool.ruff]
+# 120 not 88 (ruff's default): this codebase already runs somewhat long,
+# prose-heavy comments and docstrings, and the actual longest line in the
+# repo is 111 chars -- 120 covers everything as-is with zero reformatting,
+# rather than picking Black's default and reflowing dozens of comments
+# that were never meant to wrap at 88.
+line-length = 120
+target-version = "py312"  # matches .github/workflows/tests.yml's CI runtime
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# E/F: pycodestyle errors + pyflakes (undefined names, unused imports,
+# etc.) -- the baseline. I: import sorting (isort). UP: pyupgrade --
+# modernizes syntax for the target-version above (e.g. redundant quoted
+# forward-refs now that every module already has `from __future__ import
+# annotations`). B: flake8-bugbear -- catches likely-bug shapes (e.g.
+# zip() without strict=, assert False instead of raise AssertionError)
+# rather than just style.
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"  # matches .github/workflows/tests.yml's CI runtime
+files = ["common", "leader_follower", "leaderless", "experiments", "tests"]
+strict = true
+# The one deliberate loosening from full strict mode: test files use
+# fixtures and helper params without type hints in a few spots (pytest's
+# own idioms don't always play well with strict annotation requirements),
+# and this project doesn't want mypy pushing test-helper signatures around
+# just to satisfy strict typing rules that matter far more for the
+# production code under common/, leader_follower/, and leaderless/.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false

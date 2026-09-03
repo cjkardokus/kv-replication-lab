@@ -207,3 +207,7 @@ just implementing "a" distributed key-value store. The goal is a project
 where a specific design choice (e.g., `ack_required=0` vs. `ack_required=N`)
 produces a visible, explainable difference in behavior — not just two
 working implementations.
+
+## License
+
+[MIT](LICENSE)

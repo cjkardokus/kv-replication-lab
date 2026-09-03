@@ -1,0 +1,25 @@
+# Dev/test-only tooling, on top of the direct runtime dependencies in
+# requirements.txt: the test suite itself (pytest, plus starlette --
+# tests import starlette.responses directly for throwaway peer/follower
+# stand-ins, e.g. PlainTextResponse, even though production code never
+# imports starlette directly -- fastapi pulls it in transitively there),
+# and the lint/type-check tooling CI also runs (see
+# .github/workflows/tests.yml and pyproject.toml's [tool.ruff]/
+# [tool.mypy] configuration).
+-r requirements.txt
+
+pytest==9.1.1
+starlette==1.6.0
+# starlette.testclient (used by tests/test_server.py via
+# fastapi.testclient.TestClient) prefers httpx2 over httpx as of this
+# starlette version, warning (StarletteDeprecationWarning) if it falls
+# back to httpx. Installing httpx2 here silences that with no code
+# change: TestClient's own public API is unaffected either way, and no
+# test imports httpx2 directly -- production code keeps using httpx
+# directly and is untouched by this (httpx2 is not a drop-in replacement
+# for it; that would be a real migration, not a dev-tooling addition).
+httpx2==2.12.0
+
+ruff==0.16.5
+mypy==2.3.1
+types-PyYAML==6.0.12.20260815

@@ -40,7 +40,7 @@ class VersionedValue:
     timestamp: float
     node_id: str
 
-    def is_newer_than(self, other: "VersionedValue") -> bool:
+    def is_newer_than(self, other: VersionedValue) -> bool:
         """Return True if this version should win over `other` under LWW.
 
         Comparison rule: higher timestamp wins; if timestamps are exactly

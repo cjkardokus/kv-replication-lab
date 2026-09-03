@@ -145,7 +145,7 @@ async def discover_leader_node_id(client: httpx.AsyncClient) -> str:
     """
     resp = await client.get(f"{LEADER_URL}/health", timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
-    return resp.json()["node_id"]
+    return str(resp.json()["node_id"])
 
 
 async def _do_write(
@@ -258,6 +258,11 @@ async def run_worker(
         stats.total_requests += 1
         if item.is_read:
             stats.total_reads += 1
+            # read_target_index is only ever None for a write (see
+            # RequestPlan) -- this branch is a read, so it's always set;
+            # the assert is a narrowing for the type checker as much as
+            # a runtime check.
+            assert item.read_target_index is not None
             follower = followers[item.read_target_index]
             await _do_read(client, source_of_truth, follower, follower_node_ids, stats, item.key)
         else:
