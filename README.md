@@ -196,8 +196,17 @@ complexity once each stage is validated:
    concrete, demonstrable experiment rather than a theoretical caveat.
 3. **Future iterations** (not yet scheduled): fault injection (killing nodes
    mid-write to observe failure behavior), read-repair for the leaderless
-   path, read-your-own-writes consistency, and a Redis caching layer to
-   explore cache staleness alongside replication staleness.
+   path, read-your-own-writes consistency, a Redis caching layer to
+   explore cache staleness alongside replication staleness, and a shared
+   `ClusterConfig` base for leader_follower and leaderless (currently
+   duplicated scaffolding — `from_dict`/`from_yaml`/`_validate_*`/`with_*`
+   — around differently-shaped config fields). Deliberately deferred
+   rather than extracted now: leader-follower and leaderless are only two
+   examples to generalize from, and the message-queue replication path
+   (also planned) will be a third whose config shape isn't known yet —
+   extracting a shared base now risks designing it wrong for that third
+   shape and needing a second refactor, where waiting means doing it once,
+   correctly informed.
 
 ## Why this project
 
