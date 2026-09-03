@@ -56,3 +56,6 @@ Thumbs.db
 
 # tmux / local scratch
 *.swp
+
+# Local-only notes (kept in the working tree, not published to GitHub)
+docs/AUDIT_FINDINGS.md
