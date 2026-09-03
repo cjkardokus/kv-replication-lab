@@ -129,6 +129,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from common.models import VersionedValue
+from common.replication_client import build_replication_client
 from common.server import (
     KVResponse,
     PutRequest,
@@ -136,6 +137,7 @@ from common.server import (
     ReplicateRequest,
     ReplicateResponse,
     create_app,
+    replace_route,
 )
 from common.storage import KVStore
 
@@ -143,32 +145,21 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/leaderless_cluster.yaml"
 
-# Each node's outbound client fans out to its peers on every coordinated
-# request, so a burst of concurrent client traffic can demand far more
-# simultaneous peer connections than httpx's conservative defaults
-# (100 total / 20 keepalive) provide -- once that pool is exhausted,
-# further peer calls block waiting for a slot and time out
-# (httpx.PoolTimeout), which the coordinator can only see as "peer
-# didn't respond", pushing it toward failing quorum. These are sized
-# well above what this lab's default load (a handful of nodes, ~50
-# concurrent load-test workers) ordinarily needs, as headroom against
-# bursts rather than a promise that no volume of traffic can exhaust
-# them. Writes flood every peer regardless of W (see
+# leader_follower/leader.py and leaderless/node.py both fan requests out
+# to several peers concurrently (leaderless: reads too, not just
+# writes), so both need an httpx.AsyncClient with a connection pool
+# sized well above httpx's conservative defaults --
+# common/replication_client.py's build_replication_client() builds that
+# client for both; see that module for the pool-sizing rationale and the
+# exact constants. What's below is leaderless-specific: how much of that
+# shared headroom this strategy's own traffic pattern actually uses.
+#
+# Writes flood every peer regardless of W (see
 # QuorumCoordinator.replicate_write), so per-write connection demand is
 # the full peer count; reads contact exactly R-1 peers (see
 # QuorumCoordinator.read), so per-read demand scales with R, not peer
 # count. At this lab's cluster size (N=5) neither comes close to
-# exhausting this headroom even at full load.
-_CLIENT_MAX_CONNECTIONS = 500
-_CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
-
-# Fraction of `timeout_seconds` given to acquiring a connection from
-# the pool, specifically, rather than the connect/read/write phases of
-# a peer call. Keeping this shorter than the full timeout means a call
-# that can't get a connection quickly fails fast, freeing up the rest
-# of the quorum-collection deadline instead of tying it all up waiting
-# on a pool slot that was never going to free up in time.
-_POOL_TIMEOUT_FRACTION = 0.25
+# exhausting the shared pool's headroom even at full load.
 
 # NOTE: there used to be a _FANOUT_MARGIN constant here -- writes and
 # reads contacted `needed + margin` peers instead of exactly `needed`,
@@ -558,38 +549,14 @@ def build_app(
     app = create_app(storage, node_id)
     peers = config.peers_excluding(own_port)
     n_total = len(config.nodes)
-    # A bare float for `timeout=` applies to connect/read/write/pool
-    # phases alike, so pool-acquire contention shares the exact same
-    # budget as a slow-but-reachable peer. Give pool-acquire its own,
-    # shorter timeout instead: a call that can't get a connection
-    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) rather than tying
-    # up the whole quorum-collection deadline waiting on a slot that was
-    # never going to free up in time.
-    client_timeout = httpx.Timeout(
-        config.timeout_seconds,
-        pool=config.timeout_seconds * _POOL_TIMEOUT_FRACTION,
-    )
-    client = httpx.AsyncClient(
-        timeout=client_timeout,
-        limits=httpx.Limits(
-            max_connections=_CLIENT_MAX_CONNECTIONS,
-            max_keepalive_connections=_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
-        ),
-    )
+    client = build_replication_client(config.timeout_seconds)
     coordinator = QuorumCoordinator(peers, client, config.timeout_seconds)
     app.router.add_event_handler("shutdown", client.aclose)
 
     # Drop create_app()'s client-facing GET/PUT routes so ours take over
-    # -- Starlette matches routes in registration order, so simply adding
-    # new GET/PUT /kv/{key} routes wouldn't shadow the originals.
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/kv/{key}"
-            and ("PUT" in getattr(route, "methods", ()) or "GET" in getattr(route, "methods", ()))
-        )
-    ]
+    # -- see replace_route()'s docstring for why this is necessary, not
+    # just tidy.
+    replace_route(app, "/kv/{key}", {"PUT", "GET"})
 
     @app.put("/kv/{key}", response_model=PutResponse)
     async def put_key_coordinator(
@@ -690,14 +657,7 @@ def build_app(
         # caller explicitly opts in; otherwise this whole block doesn't
         # run and /internal/replicate stays create_app()'s stock,
         # unmodified handler.
-        app.router.routes = [
-            route
-            for route in app.router.routes
-            if not (
-                getattr(route, "path", None) == "/internal/replicate"
-                and "POST" in getattr(route, "methods", ())
-            )
-        ]
+        replace_route(app, "/internal/replicate", {"POST"})
 
         @app.post("/internal/replicate", response_model=ReplicateResponse)
         async def replicate_with_injected_delay(body: ReplicateRequest, request: Request) -> ReplicateResponse:

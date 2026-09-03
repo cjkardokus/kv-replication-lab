@@ -46,13 +46,28 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
-from common.server import PutRequest, PutResponse, ReplicateResponse, create_app
+from common.replication_client import build_replication_client
+from common.server import PutRequest, PutResponse, ReplicateResponse, create_app, replace_route
 from common.storage import KVStore
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 
+# leader_follower/leader.py and leaderless/node.py both fan a write (and,
+# for leaderless, a read) out to several peers concurrently, so both need
+# an httpx.AsyncClient with a connection pool sized well above httpx's
+# conservative defaults -- otherwise a queued replicate call waits out
+# the full client timeout for a connection slot and then gives up
+# (httpx.PoolTimeout), silently dropping a write the client was already
+# told succeeded. That client, and the pool-sizing constants behind it,
+# are now built by common/replication_client.py's build_replication_client(),
+# shared between both modules -- see that module for the generic pool
+# rationale. Nothing below defines the pool's size directly any more;
+# what's below is leader-follower-specific history about *why* pool
+# sizing mattered here, and how it relates to
+# `_MAX_CONCURRENT_REPLICATE_CALLS`.
+#
 # At ack_required>=1 the write path awaits at least one follower ack
 # before returning, which naturally throttles how many replicate()
 # calls can be in flight at once (bounded by however many client writes
@@ -60,16 +75,17 @@ DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 # ack_required=0 (fire-and-forget) there is no such backpressure --
 # every write immediately fires len(followers) background tasks with
 # nothing waiting on them, so a sustained burst of writes can demand far
-# more simultaneous outbound connections than httpx's conservative
-# defaults (100 total / 20 keepalive) provide. Once that pool was
+# more simultaneous outbound connections than the pool's old, unsized
+# defaults (100 total / 20 keepalive) provided. Once that pool was
 # exhausted, a queued replicate call used to wait out the full client
 # timeout for a connection slot and then give up (httpx.PoolTimeout) --
 # a write the client was told succeeded never actually reached that
-# follower at all. Sizing the pool up (below) fixes exactly that: with
-# ack_required 1..4, replicate delivery is 100% and the leader logs zero
-# exceptions, confirmed via experiments/run_comparison.py.
+# follower at all. Sizing the pool up (see common/replication_client.py)
+# fixes exactly that: with ack_required 1..4, replicate delivery is 100%
+# and the leader logs zero exceptions, confirmed via
+# experiments/run_comparison.py.
 #
-# ack_required=0 used to be a different story, and *raising this pool
+# ack_required=0 used to be a different story, and *raising the pool
 # size alone did not fix it* -- it only relocated where it broke. The
 # original small pool was accidentally acting as admission control: it
 # dropped excess replicate attempts fast (silent data loss -- ~87% of
@@ -94,58 +110,66 @@ DEFAULT_CONFIG_PATH = "config/leader_follower_cluster.yaml"
 # `_MAX_CONCURRENT_REPLICATE_CALLS` below (a semaphore around the
 # outbound POST in `Replicator._send`, shared across every write this
 # leader handles, not just one write's own fan-out) -- see that
-# constant's comment for the sizing rationale. The pool size here and
-# the semaphore below do different jobs: the pool exists so a call that
-# *is* admitted never fails to find a connection; the semaphore exists
-# so this leader never admits more concurrent follower calls than it or
-# the followers can absorb, regardless of how fast writes arrive. See
+# constant's comment for the sizing rationale. The pool and the
+# semaphore below do different jobs: the pool exists so a call that *is*
+# admitted never fails to find a connection; the semaphore exists so
+# this leader never admits more concurrent follower calls than it or the
+# followers can absorb, regardless of how fast writes arrive. See
 # docs/results.md for the ack_required sweep this was confirmed against,
 # both before and after the semaphore fix.
 #
-# _CLIENT_MAX_CONNECTIONS/_CLIENT_MAX_KEEPALIVE_CONNECTIONS below are a
-# single module-level setting applied identically no matter what
-# ack_required this leader is launched with -- there is no per-config
-# pool sizing. That matters because Replicator never cancels a follower
-# it stops waiting on (see Replicator.replicate below), so *every*
-# ack_required value fans a write out to all 4 followers concurrently,
-# not just the ones it waits on -- ack_required only changes how many of
-# those 4 in-flight calls the write path blocks on before returning.
-# Confirmed by isolation-testing this exact pool change at fixed
-# ack_required values (same followers, same load, only the pool setting
-# swapped, leader.py restored after): at ack_required=2, the old
-# unset-Limits default (100/20, pre-dating this pool sizing) measured
-# 0.00% staleness / 0 failures on a reduced run where the current 500/100
-# pool measures 8.87% staleness on the identical run; at ack_required=3,
-# 0.06% (old) vs 4.60% (new). In other words, the small pool wasn't only
-# masking ack_required=0's silent drops -- it was quietly acting as
-# admission control for every ack_required value, at a severity scaled to
-# each one's own concurrency. Enlarging it for ack_required=0 removed
-# that masking everywhere at once, which is why the ack_required=1..4
-# staircase in docs/results.md only became measurable after this fix,
-# not before it. The staircase is genuine replication lag, not an
-# artifact of this fix or of the _MAX_CONCURRENT_REPLICATE_CALLS
-# semaphore added later -- see the isolation-test evidence above -- but
-# it's worth knowing that connection-pool size is currently one global
-# knob that shapes every config's apparent staleness, not a per-config
-# setting.
-_CLIENT_MAX_CONNECTIONS = 500
-_CLIENT_MAX_KEEPALIVE_CONNECTIONS = 100
-
-# Fraction of `timeout_seconds` given to acquiring a connection from
-# the pool, specifically, rather than the connect/read/write phases of
-# a replicate call -- see build_app().
-_POOL_TIMEOUT_FRACTION = 0.25
+# The pool being one shared setting -- not scoped per `ack_required`,
+# and (now that leaderless/node.py builds its client the same way) not
+# even scoped per replication strategy -- is itself significant history,
+# not just an implementation detail: `Replicator` never cancels a
+# follower it stops waiting on (see Replicator.replicate below), so
+# *every* ack_required value fans a write out to all 4 followers
+# concurrently, not just the ones it waits on -- ack_required only
+# changes how many of those 4 in-flight calls the write path blocks on
+# before returning. Confirmed by isolation-testing this exact pool
+# change at fixed ack_required values (same followers, same load, only
+# the pool setting swapped, leader.py restored after): at ack_required=2,
+# the old unset-Limits default (100/20, pre-dating this pool sizing)
+# measured 0.00% staleness / 0 failures on a reduced run where the
+# current 500/100 pool measures 8.87% staleness on the identical run; at
+# ack_required=3, 0.06% (old) vs 4.60% (new). In other words, the small
+# pool wasn't only masking ack_required=0's silent drops -- it was
+# quietly acting as admission control for every ack_required value, at a
+# severity scaled to each one's own concurrency. Enlarging it for
+# ack_required=0 removed that masking everywhere at once, which is why
+# the ack_required=1..4 staircase in docs/results.md only became
+# measurable after this fix, not before it. The staircase is genuine
+# replication lag, not an artifact of this fix or of the
+# _MAX_CONCURRENT_REPLICATE_CALLS semaphore added later -- see the
+# isolation-test evidence above -- but it's worth knowing that
+# connection-pool size is currently one global knob (shared across both
+# replication strategies) that shapes every config's apparent staleness,
+# not a per-config setting.
 
 # Bounds how many replicate() calls to followers this leader ever has
-# outstanding *at once, across every write it's handling* -- unlike
-# _CLIENT_MAX_CONNECTIONS above, which only stops an admitted call from
-# failing to find a connection, this is what actually stops
-# ack_required=0 from admitting unbounded concurrent fan-out in the
-# first place (see that constant's comment for the failure mode this
+# outstanding *at once, across every write it's handling* -- unlike the
+# connection pool (common/replication_client.py), which only stops an
+# admitted call from failing to find a connection, this is what actually
+# stops ack_required=0 from admitting unbounded concurrent fan-out in
+# the first place (see the block above for the failure mode this
 # closes: an unbounded pile-up of concurrent replicate() calls that
 # eventually starved the leader's own event loop). Enforced in
 # Replicator._send, around the outbound POST only -- not around response
 # parsing, which is pure CPU and never worth gating.
+#
+# Deliberately kept local to this module, not folded into
+# common/replication_client.py alongside the pool-sizing it's related
+# to: leaderless/node.py's QuorumCoordinator floods every peer on every
+# write exactly like Replicator does (see that module's own comments),
+# so it has the same theoretical unbounded-fan-out shape ack_required=0
+# used to -- but that's never actually been measured or confirmed to
+# exhibit ack_required=0's event-loop-starvation failure mode the way
+# leader-follower was. Giving leaderless this same semaphore as a side
+# effect of sharing a client factory with it would be a real,
+# un-requested behavior change, not the pure extraction this refactor
+# (see docs/AUDIT_FINDINGS.md's §5) is meant to be. If leaderless turns
+# out to need the same fix, that should be its own deliberate change,
+# backed by its own measurement -- not an accident of code sharing.
 #
 # Sized well above what a backpressured config (ack_required>=1) could
 # ever demand at this lab's normal load: every ack_required value fans a
@@ -159,8 +183,9 @@ _POOL_TIMEOUT_FRACTION = 0.25
 # writers x 4 =~ 60 concurrent sends in practice). 256 leaves comfortable
 # headroom above both numbers, so ack_required>=1 configs essentially
 # never see this semaphore as a bottleneck, while still sitting well
-# under _CLIENT_MAX_CONNECTIONS (500) -- so *this* is what actually runs
-# out first for ack_required=0's unthrottled write path, not an
+# under the connection pool's own 500-connection ceiling
+# (common/replication_client.py) -- so *this* is what actually runs out
+# first for ack_required=0's unthrottled write path, not an
 # httpx.PoolTimeout. That distinction matters: hitting this semaphore
 # just means a coroutine waits in-process for a slot (cheap, no network
 # resource held); hitting the connection pool's own limit means an
@@ -260,8 +285,9 @@ class Replicator:
     awaiting a follower, a sustained burst of writes previously had no
     limit on how many replicate() calls could pile up concurrently,
     which under sustained load eventually starved the leader's own event
-    loop (see _CLIENT_MAX_CONNECTIONS' comment for the investigation
-    that found this). ack_required>=1 configs are already naturally
+    loop (see the connection-pool comment block above
+    _MAX_CONCURRENT_REPLICATE_CALLS for the investigation that found
+    this). ack_required>=1 configs are already naturally
     throttled by however many client writes are concurrently in flight,
     so this bound is sized to sit comfortably above that in normal
     operation and meaningfully engage only for ack_required=0.
@@ -400,38 +426,14 @@ def build_app(node_id: str, config: ClusterConfig) -> FastAPI:
     """
     storage = KVStore()
     app = create_app(storage, node_id)
-    # A bare float for `timeout=` applies to connect/read/write/pool
-    # phases alike, so pool-acquire contention shares the exact same
-    # budget as a slow-but-reachable follower. Give pool-acquire its own,
-    # shorter timeout instead: a call that can't get a connection
-    # quickly fails fast (see _POOL_TIMEOUT_FRACTION) rather than tying
-    # up the whole ack-collection deadline waiting on a slot that was
-    # never going to free up in time.
-    client_timeout = httpx.Timeout(
-        config.timeout_seconds,
-        pool=config.timeout_seconds * _POOL_TIMEOUT_FRACTION,
-    )
-    client = httpx.AsyncClient(
-        timeout=client_timeout,
-        limits=httpx.Limits(
-            max_connections=_CLIENT_MAX_CONNECTIONS,
-            max_keepalive_connections=_CLIENT_MAX_KEEPALIVE_CONNECTIONS,
-        ),
-    )
+    client = build_replication_client(config.timeout_seconds)
     replicator = Replicator(config, client)
     app.router.add_event_handler("shutdown", client.aclose)
 
     # Drop create_app()'s client-facing PUT route so ours takes over --
-    # Starlette matches routes in registration order, so simply adding a
-    # new PUT /kv/{key} route wouldn't shadow the original.
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/kv/{key}"
-            and "PUT" in getattr(route, "methods", ())
-        )
-    ]
+    # see replace_route()'s docstring for why this is necessary, not
+    # just tidy.
+    replace_route(app, "/kv/{key}", {"PUT"})
 
     @app.put("/kv/{key}", response_model=PutResponse)
     async def put_key_leader(key: str, body: PutRequest, request: Request) -> PutResponse:
