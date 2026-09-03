@@ -113,6 +113,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import random
@@ -125,6 +126,7 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
+from pydantic import ValidationError
 
 from common.models import VersionedValue
 from common.server import (
@@ -457,8 +459,24 @@ class QuorumCoordinator:
                 "replicate to %s failed", peer.replicate_url, exc_info=True
             )
             return False, None
-        body = resp.json()
-        if not body.get("applied", True):
+        # Validate against the real response schema rather than indexing
+        # resp.json() as a raw dict -- a peer that responds 200 with a
+        # non-JSON or incomplete body must not crash this coroutine with
+        # an uncaught exception: json.JSONDecodeError ("not valid JSON")
+        # and pydantic.ValidationError ("valid JSON, wrong/missing
+        # fields") are handled identically here, the same as
+        # httpx.HTTPError above -- a failed ack, not a raised exception
+        # that would otherwise propagate out of _gather() and surface to
+        # the client as a bare 500 instead of the usual "N/M acks" 503.
+        try:
+            parsed = ReplicateResponse.model_validate(resp.json())
+        except (json.JSONDecodeError, ValidationError):
+            logger.warning(
+                "replicate to %s returned a malformed response body",
+                peer.replicate_url, exc_info=True,
+            )
+            return False, None
+        if not parsed.applied:
             logger.warning(
                 "replicate to %s was received but not applied "
                 "(peer already held a newer/equal write) key=%s",
@@ -493,9 +511,22 @@ class QuorumCoordinator:
                 peer.internal_read_url(key), resp.status_code,
             )
             return False, None
-        body = resp.json()
+        # Validate against the real response schema rather than indexing
+        # resp.json() as a raw dict -- see _replicate_outcome above for
+        # why: a peer's 200 with a non-JSON or incomplete body must not
+        # crash this coroutine with an uncaught exception (previously a
+        # bare KeyError here), it's a failed response, same as an
+        # unreachable peer.
+        try:
+            parsed = KVResponse.model_validate(resp.json())
+        except (json.JSONDecodeError, ValidationError):
+            logger.warning(
+                "internal read from %s returned a malformed response body",
+                peer.internal_read_url(key), exc_info=True,
+            )
+            return False, None
         entry = VersionedValue(
-            value=body["value"], timestamp=body["timestamp"], node_id=body["node_id"]
+            value=parsed.value, timestamp=parsed.timestamp, node_id=parsed.node_id
         )
         return True, entry
 

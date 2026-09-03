@@ -45,6 +45,7 @@ import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from starlette.responses import PlainTextResponse
 
 from common.server import ReplicateResponse, create_app
 from common.storage import KVStore
@@ -154,6 +155,33 @@ def _slow_follower_app(node_id: str, delay_seconds: float) -> FastAPI:
 
 def create_follower_with_storage(node_id: str, storage: KVStore) -> FastAPI:
     return create_app(storage, node_id)
+
+
+def _malformed_follower_app(node_id: str) -> FastAPI:
+    """A follower whose /internal/replicate responds 200 OK with a
+    non-JSON body -- a real, if unusual, way a follower could misbehave
+    (a crashed/misbehaving node, a proxy injecting a body, a
+    version-skewed peer). Exercises Replicator._send's malformed-response
+    handling (see docs/AUDIT_FINDINGS.md's §3): this must be treated as
+    a failed ack, not crash the write path with an unhandled 500.
+    """
+    storage = KVStore()
+    app = create_follower_with_storage(node_id, storage)
+
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == "/internal/replicate"
+            and "POST" in getattr(route, "methods", ())
+        )
+    ]
+
+    @app.post("/internal/replicate")
+    def malformed_replicate(body: dict) -> PlainTextResponse:  # type: ignore[type-arg]
+        return PlainTextResponse("not json", status_code=200)
+
+    return app
 
 
 # --- Tests ----------------------------------------------------------------
@@ -291,6 +319,32 @@ def test_unreachable_follower_does_not_block_success_when_others_suffice(cluster
     # ack from the reachable follower should satisfy ack_required well
     # under the 2s timeout.
     assert elapsed < 1.0
+
+
+# --- Malformed peer response handling ---------------------------------------
+
+
+def test_malformed_follower_response_fails_ack_not_500(cluster):
+    """docs/AUDIT_FINDINGS.md's §3: a follower that responds 200 with a
+    malformed body used to crash the write path with an unhandled 500
+    (json.JSONDecodeError propagating out of Replicator._send, through
+    replicate(), to the client) instead of being counted as a plain
+    failed ack. With one good follower and one malformed one at
+    ack_required=2, only the good one can ever ack -- this should fail
+    loudly with the project's usual 503/"N/M acks" shape, never a 500.
+    """
+    good = cluster(build_follower_app("good"))
+    malformed = cluster(_malformed_follower_app("malformed"))
+
+    config = ClusterConfig(
+        followers=[good.address, malformed.address], ack_required=2, timeout_seconds=1.0
+    )
+    leader = cluster(build_leader_app("leader-1", config))
+
+    resp = httpx.put(f"http://{leader.host}:{leader.port}/kv/k", json={"value": "v1"})
+
+    assert resp.status_code == 503
+    assert "1/2" in resp.json()["detail"]
 
 
 # --- Connection-pool sizing (module-level, not per-config) -----------------
