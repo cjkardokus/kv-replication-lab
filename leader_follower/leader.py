@@ -222,7 +222,7 @@ class ClusterConfig:
     timeout_seconds: float
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "ClusterConfig":
+    def from_dict(cls, raw: dict[str, Any]) -> ClusterConfig:
         followers = [
             Follower(host=f["host"], port=int(f["port"]))
             for f in raw.get("followers", [])
@@ -243,7 +243,7 @@ class ClusterConfig:
         )
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "ClusterConfig":
+    def from_yaml(cls, path: str | Path) -> ClusterConfig:
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         return cls.from_dict(raw)
@@ -256,7 +256,7 @@ class ClusterConfig:
                 f"the number of followers ({len(followers)})"
             )
 
-    def with_ack_required(self, ack_required: int) -> "ClusterConfig":
+    def with_ack_required(self, ack_required: int) -> ClusterConfig:
         """Return a copy of this config with ack_required overridden,
         e.g. by a --ack-required CLI flag. Validated the same way as
         the YAML-sourced value (0 to len(followers)).
@@ -300,7 +300,7 @@ class Replicator:
         # Must keep a strong reference to background tasks: asyncio only
         # holds a *weak* reference to scheduled tasks, so a task with no
         # other referent can be garbage-collected mid-flight.
-        self._background: set[asyncio.Task] = set()
+        self._background: set[asyncio.Task[Any]] = set()
 
     async def replicate(
         self, key: str, value: Any, timestamp: float, node_id: str
@@ -323,7 +323,7 @@ class Replicator:
             "timestamp": timestamp,
             "node_id": node_id,
         }
-        pending: set[asyncio.Task] = {
+        pending: set[asyncio.Task[Any]] = {
             asyncio.ensure_future(self._send(follower, payload))
             for follower in self._config.followers
         }

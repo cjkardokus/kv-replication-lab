@@ -91,19 +91,20 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 
 from experiments import leaderless_staleness_load_test
+from experiments._load_test_common import LoadTestResult
 from experiments._results_doc import RESULTS_HEADER, RESULTS_HEADER_MARKER, replace_section
 from experiments.run_comparison import (
     LEADERLESS_HOST,
     LEADERLESS_NODE_PORTS,
-    NodeStartupError,
     REPO_ROOT,
     RESULTS_PATH,
+    NodeStartupError,
     SpawnedNode,
     _spawn,
     _stop_all,
@@ -159,7 +160,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _write_results_section(
-    args: argparse.Namespace, result: leaderless_staleness_load_test.LoadTestResult
+    args: argparse.Namespace, result: LoadTestResult
 ) -> None:
     """Write this run's result into docs/results.md's own marked
     section (see experiments/_results_doc.py), leaving the main sweep's
@@ -171,7 +172,7 @@ def _write_results_section(
     that, and this module's own docstring above for the exploration
     that led to --delay-ms/--delayed-node-count's default values.
     """
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    generated_at = datetime.now(UTC).isoformat(timespec="seconds")
     stats = result.stats
     lines = [
         "## Demonstrating the W+R boundary case",

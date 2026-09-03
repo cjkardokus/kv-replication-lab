@@ -34,7 +34,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from starlette.responses import PlainTextResponse
 
-from common.server import KVResponse, ReplicateResponse, create_app
+from common.server import KVResponse, ReplicateResponse, create_app, replace_route
 from common.storage import KVStore
 from leaderless.node import (
     ClusterConfig,
@@ -44,14 +44,13 @@ from leaderless.node import (
     build_app,
 )
 
-
 # --- Real-server test harness --------------------------------------------
 
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        return int(s.getsockname()[1])
 
 
 class RunningServer:
@@ -69,7 +68,7 @@ class RunningServer:
         self.server = uvicorn.Server(config)
         self._thread = threading.Thread(target=self.server.run, daemon=True)
 
-    def start(self) -> "RunningServer":
+    def start(self) -> RunningServer:
         self._thread.start()
         deadline = time.time() + 5
         while not self.server.started:
@@ -121,7 +120,7 @@ def _build_cluster(
     )
     servers = [
         cluster(build_app(node_id, port, config), port)
-        for node_id, port in zip(node_ids, ports)
+        for node_id, port in zip(node_ids, ports, strict=True)
     ]
     return servers, config
 
@@ -170,11 +169,10 @@ def _counting_peer_app(node_id: str, storage: KVStore, received: list[str]) -> F
     """
     app = _peer_app(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if getattr(route, "path", None) not in ("/internal/replicate", "/internal/kv/{key}")
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/replicate", {"POST"})
+    replace_route(app, "/internal/kv/{key}", {"GET"})
 
     @app.post("/internal/replicate", response_model=ReplicateResponse)
     def replicate(body: dict) -> ReplicateResponse:  # type: ignore[type-arg]
@@ -205,14 +203,9 @@ def _slow_peer_app(node_id: str, storage: KVStore, *, replicate_delay: float) ->
     """
     app = _peer_app(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/internal/replicate"
-            and "POST" in getattr(route, "methods", ())
-        )
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/replicate", {"POST"})
 
     @app.post("/internal/replicate", response_model=ReplicateResponse)
     def slow_replicate(body: dict) -> ReplicateResponse:  # type: ignore[type-arg]
@@ -233,14 +226,9 @@ def _malformed_replicate_peer_app(node_id: str, storage: KVStore) -> FastAPI:
     """
     app = _peer_app(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/internal/replicate"
-            and "POST" in getattr(route, "methods", ())
-        )
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/replicate", {"POST"})
 
     @app.post("/internal/replicate")
     def malformed_replicate(body: dict) -> PlainTextResponse:  # type: ignore[type-arg]
@@ -258,11 +246,9 @@ def _malformed_read_peer_app(node_id: str, storage: KVStore) -> FastAPI:
     """
     app = _peer_app(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if getattr(route, "path", None) != "/internal/kv/{key}"
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/kv/{key}", {"GET"})
 
     @app.get("/internal/kv/{key}")
     def malformed_internal_get(key: str) -> PlainTextResponse:

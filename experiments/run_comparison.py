@@ -67,7 +67,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -138,7 +138,7 @@ class SpawnedNode:
     label: str
     host: str
     port: int
-    proc: subprocess.Popen
+    proc: subprocess.Popen[bytes]
     log_path: Path
 
 
@@ -494,7 +494,7 @@ def _write_markdown_report(outcomes: list[Outcome], path: Path) -> None:
     errors = [o for o in outcomes if isinstance(o, ConfigError)]
     ranked = sorted(results, key=lambda r: r.staleness_rate)
 
-    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    generated_at = datetime.now(UTC).isoformat(timespec="seconds")
     lines = [
         "## Main sweep",
         "",
