@@ -33,8 +33,11 @@ than the whole run aborting on one bad config.
 
 Output
 ------
-Besides the combined terminal report and docs/results.md, every node
-process's stdout/stderr is captured under
+Besides the combined terminal report, this script writes its table into
+docs/results.md's own marked section (see experiments/_results_doc.py)
+-- that file is auto-generated and mechanical only, never hand-edited;
+see README.md's "Results" section for the analysis of what these
+numbers mean. Every node process's stdout/stderr is also captured under
 experiments/output/run_comparison_process_logs/, and each config's own
 stale-read/failure JSONL logs (the same ones staleness_load_test.py and
 leaderless_staleness_load_test.py produce standalone) are written under
@@ -54,7 +57,6 @@ process startup/teardown overhead -- around 7 minutes end to end.
 from __future__ import annotations
 
 import asyncio
-import re
 import subprocess
 import sys
 import time
@@ -65,6 +67,7 @@ from pathlib import Path
 import httpx
 
 from experiments import leaderless_staleness_load_test, staleness_load_test
+from experiments._results_doc import RESULTS_HEADER, RESULTS_HEADER_MARKER, replace_section
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_PATH = REPO_ROOT / "docs" / "results.md"
@@ -106,7 +109,8 @@ LEADERLESS_WR_SWEEP = [
     # guaranteed by the rule, unlike the four configs above. Whether
     # that shows up as measurable staleness in *this* benchmark is a
     # separate question from whether it's guaranteed -- see
-    # _KNOWN_CHARACTERISTICS_NOTES below.
+    # experiments/leaderless_boundary_case_demo.py and README.md's
+    # "Results" section.
     ("W=2, R=3", 2, 3),
 ]
 
@@ -418,169 +422,36 @@ def _print_report(outcomes: list[Outcome]) -> None:
         print("!" * width)
 
 
-# Fixed, hand-written explanation of two known, investigated
-# characteristics of this sweep's numbers -- included in every generated
-# report (not just this run's) since they're properties of the current
-# implementation and this benchmark's settings, not one-off flukes.
-# Update this alongside the code comments it references
-# (leader_follower/leader.py's _CLIENT_MAX_CONNECTIONS block,
-# leaderless/node.py's _FANOUT_MARGIN block, and the top of
-# experiments/leaderless_staleness_load_test.py) if either changes.
-_KNOWN_CHARACTERISTICS_NOTES = """\
-## Why these results look the way they do
-
-### `ack_required=0` has high staleness, high failures, and much higher elapsed time than every other leader-follower config
-
-This is expected, not a bug -- `ack_required=0` is fire-and-forget: the \
-write path never awaits any follower before returning, so there is zero \
-backpressure on how fast writes can be issued. Under this benchmark's \
-sustained, unthrottled load, that has two real, compounding \
-consequences:
-
-- **Every value is real, but the ranking reflects a genuine trade-off, \
-  not a measurement error.** `ack_required=1..3` show a clean monotonic \
-  staleness staircase with zero internal exceptions logged on the \
-  leader -- awaiting even one real ack naturally bounds how many \
-  replicate calls can be in flight at once (bounded by how many client \
-  writes are concurrently in flight). `ack_required=4` (fully \
-  synchronous -- every follower must ack before the client sees success) \
-  now shows exactly 0.00% -- see below.
-- **`ack_required=0` has no such bound.** A large connection pool \
-  (`leader_follower/leader.py`'s `_CLIENT_MAX_CONNECTIONS`) avoids \
-  silently dropping replicated writes to `httpx.PoolTimeout`, but \
-  doesn't fix the underlying lack of backpressure: under sustained load \
-  the followers (plain uvicorn, no concurrency limiting of their own) \
-  get more concurrent replicate traffic than they can drain, which \
-  keeps each replicate call alive longer, which lets yet more \
-  unthrottled writes pile up before the old ones finish -- a feedback \
-  loop that eventually starves the *leader's own* event loop badly \
-  enough to time out on its own trivial, in-memory-only client-facing \
-  PUT endpoint. See `leader_follower/leader.py`'s `_CLIENT_MAX_CONNECTIONS` \
-  comment for the full investigation and exact failure counts.
-- **The connection pool is one global setting, not scoped per \
-  `ack_required` -- and that's *why* the staircase above is only \
-  visible now.** `Replicator` fans every write out to all 4 followers \
-  concurrently regardless of `ack_required`, and never cancels the \
-  followers it stops waiting on -- `ack_required` only changes how many \
-  of those 4 in-flight calls the write path blocks on before returning. \
-  So the *old*, smaller pool (httpx's unset-`Limits` default of 100 \
-  connections/20 keepalive, before this fix) was silently dropping \
-  excess fan-out to `PoolTimeout` at every `ack_required` value, not \
-  just 0 -- just severely enough to matter only at 0's much higher \
-  concurrency. Isolation-tested directly: with everything else held \
-  fixed (same followers, same load), swapping only the pool setting at \
-  `ack_required=2` measured 0.00% staleness / 0 failures under the old \
-  pool vs. 8.87% under the current one; at `ack_required=3`, 0.06% (old) \
-  vs. 4.60% (new). Enlarging the pool to stop ack_required=0's silent \
-  drops therefore also stopped 1..4's silent drops, which is what makes \
-  the staircase measurable at all now -- it is real replication lag, not \
-  an artifact of this fix, but it did not exist as an *observable* number \
-  before this fix for the same underlying reason ack_required=0's did \
-  not.
-
-Fixing `ack_required=0`'s own missing backpressure for real would mean \
-bounding *concurrent in-flight replicate fan-out* independently of \
-connection-pool size (e.g. a semaphore in `Replicator`) -- deliberately \
-left undone: this is a lab for observing replication trade-offs, and \
-`ack_required=0`'s feedback loop and the 1..3 staircase are both real \
-characteristics of the current implementation under real load, not \
-measurement bugs to engineer away.
-
-### `ack_required=4` shows exactly 0.00% staleness -- provably, not just observed
-
-This is a mathematical floor, not a favorable roll: once \
-`ack_required=4` (= the follower count) is satisfied, *every* follower \
-has already responded to that write's replicate call -- including a \
-follower that rejected it because it already held something \
-LWW-newer, since an "ack" only means "responded", not "applied" (see \
-`Replicator._send`). Either way, every follower's stored timestamp for \
-that key is `>=` the just-acked write's timestamp at that instant, and \
-LWW never regresses a stored timestamp -- so it stays `>=` forever \
-after. A later read of any follower for that key can therefore never \
-see anything older than the newest write that ever reached full \
-`ack_required=4` quorum. This isn't specific to this lab's \
-implementation -- it's the general property that makes `ack_required = \
-len(followers)` "fully synchronous" a meaningful phrase at all.
-
-Earlier runs of this sweep measured a small but nonzero rate here \
-(roughly 1.2-1.3%) despite that guarantee, which was the tell that \
-something *other* than real replication lag was being measured -- \
-tracked down to `staleness_load_test.py`'s write path re-reading the \
-leader's *current* value after a write succeeded (since `PutResponse` \
-didn't echo back the timestamp it stamped), rather than trusting that \
-write's own result. A different, unrelated concurrent write to the \
-same key could land in that gap and get misattributed as this write's \
-own confirmed value, before its *own* replication had necessarily \
-finished. Fixed by having `PutResponse` return the timestamp it \
-stamped directly (see `common/server.py::PutResponse`), so both load \
-tests record each write's ground truth from its own response, never a \
-separate re-read. `ack_required=4` immediately dropped from ~1.2% to \
-exactly 0.00%, with no other change to any replication code -- as \
-clean a confirmation as this kind of artifact gets.
-
-### Leaderless staleness stays near-zero for every config, including `W=2,R=3`, which is genuinely not guaranteed
-
-`W=1,R=5`, `W=5,R=1`, `W=3,R=3` are legitimately guaranteed by the \
-classic W+R>N overlap rule (or one side already equals N) -- 0.00% \
-there isn't a finding. `W=1,R=1` and `W=2,R=3` are **not** guaranteed \
-(`1+1=2` and `2+3=5`, neither `>5`), and as of this fix, genuinely not: \
-`QuorumCoordinator` contacts exactly the peers each config's literal W/R \
-implies (see `replicate_write`/`read` in `leaderless/node.py`, and \
-`tests/test_leaderless.py`'s `test_write_floods_every_peer_regardless_of_w` \
-/ `test_read_contacts_exactly_r_minus_one_peers`, which assert the exact \
-contact counts directly) -- no resilience margin quietly padding \
-coverage past the nominal values the way the old `_FANOUT_MARGIN` did.
-
-Both still measure at or near 0.00% run to run (`W=1,R=1` has shown a \
-small nonzero rate on occasion; `W=2,R=3` has not, so far) -- run-to-run \
-noise around a real floor, not two separate coincidences or a residual \
-bug in the fix: **every write floods every peer unconditionally, \
-regardless of W** (durability is fully decoupled from the ack-wait -- \
-see the module docstring), and that flood completes in low single-digit \
-milliseconds on localhost -- far faster than the ~250-330ms average gap \
-between requests touching the same key at this benchmark's throughput \
-(10,000 requests / 100 keys). By the time a subsequent read arrives, the \
-write has almost always finished landing everywhere already, so neither \
-config's real non-guarantee gets much chance to manifest. This was \
-already known and documented for `W=1,R=1` \
-specifically (see `experiments/leaderless_staleness_load_test.py`'s \
-module comment) -- making the fan-out exact rather than margin-padded \
-didn't shrink this effect, it *generalized* it: previously only `W=1`'s \
-unconditional full flood was fast enough to hide behind loopback speed; \
-now every W value floods unconditionally by design, so every \
-non-guaranteed config inherits the same blind spot, not just `W=1,R=1`.
-
-Reproducing genuine leaderless staleness locally now needs the same \
-intervention already scoped for `W=1,R=1`: shrinking the key pool \
-(heavier same-key contention), injecting artificial per-peer replication \
-delay, or real network latency (the planned EC2 stage) -- left undone \
-here since it's a benchmark-realism change, not a coordinator-logic fix."""
-
-# The source above wraps long paragraphs across multiple lines with `\`
-# continuations, indented for readability under bullets -- collapse the
-# resulting runs of 2+ spaces (but not the single spaces `\`
-# continuation already inserts, nor newlines/paragraph breaks) back down
-# to one, so none of that source-only wrapping leaks into the rendered
-# markdown.
-_KNOWN_CHARACTERISTICS_NOTES = re.sub(r" {2,}", " ", _KNOWN_CHARACTERISTICS_NOTES)
-
-
 def _write_markdown_report(outcomes: list[Outcome], path: Path) -> None:
+    """Write this run's main-sweep table into docs/results.md's own
+    marked section (see experiments/_results_doc.py), leaving any other
+    section already in the file -- e.g.
+    leaderless_boundary_case_demo.py's -- untouched.
+
+    Mechanical only, by design: a table, a run timestamp, and a pointer
+    to the raw JSONL logs -- no hand-authored analysis of *why* the
+    numbers look the way they do. That used to live here too, hardcoded
+    as a fixed string reproduced in every report regardless of what the
+    table above it actually said -- see docs/AUDIT_FINDINGS.md's §6 for
+    why that turned out to be a bad idea (git history:
+    _KNOWN_CHARACTERISTICS_NOTES, removed) and README.md's "Results"
+    section for where that analysis lives now instead.
+    """
     results = [o for o in outcomes if isinstance(o, ConfigResult)]
     errors = [o for o in outcomes if isinstance(o, ConfigError)]
     ranked = sorted(results, key=lambda r: r.staleness_rate)
 
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     lines = [
-        "# Replication strategy comparison results",
+        "## Main sweep",
         "",
         f"Generated by `experiments/run_comparison.py` on {generated_at}.",
         "",
         "Ranked by staleness rate ascending (lowest/best first). See the top-level "
-        "`README.md` for what each strategy and parameter means, and "
-        "`experiments/staleness_load_test.py` / "
-        "`experiments/leaderless_staleness_load_test.py` for how staleness and "
-        "failures are measured.",
+        "`README.md` for what each strategy/parameter means and the hand-maintained "
+        "interpretation of these numbers -- why they look the way they do. Raw "
+        "per-config stale-read/failure JSONL logs: "
+        f"`{LOAD_TEST_LOG_DIR.relative_to(REPO_ROOT)}/`.",
         "",
         "| Rank | Strategy | Config | Staleness rate | Elapsed | Failures | Total requests |",
         "|---|---|---|---|---|---|---|",
@@ -591,16 +462,14 @@ def _write_markdown_report(outcomes: list[Outcome], path: Path) -> None:
             f"{r.elapsed:.1f}s | {r.total_failures} | {r.total_requests} |"
         )
 
-    lines += ["", _KNOWN_CHARACTERISTICS_NOTES]
-
     if errors:
-        lines += ["", "## Skipped configurations", ""]
+        lines += ["", "### Skipped configurations", ""]
         lines += ["| Strategy | Config | Reason |", "|---|---|---|"]
         for e in errors:
             lines.append(f"| {e.strategy} | {e.label} | {e.reason} |")
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n")
+    replace_section(path, RESULTS_HEADER_MARKER, RESULTS_HEADER)
+    replace_section(path, "main-sweep", "\n".join(lines))
 
 
 # --- Entrypoint -------------------------------------------------------------
