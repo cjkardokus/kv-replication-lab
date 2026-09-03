@@ -398,6 +398,58 @@ def test_r_query_param_out_of_range_rejected(cluster):
     assert resp.status_code == 422
 
 
+# --- Fault injection (--fault-inject-delay-ms, off by default) -------------
+
+
+def test_fault_inject_delay_disabled_by_default_replicate_is_unmodified(cluster):
+    """build_app()'s default (fault_inject_delay_seconds=0.0) must leave
+    /internal/replicate exactly as create_app() provides it -- no
+    artificial delay, unless a caller explicitly opts in.
+    """
+    port = _free_port()
+    node = Node(host="127.0.0.1", port=port)
+    config = ClusterConfig(nodes=[node], default_w=1, default_r=1, timeout_seconds=2.0)
+    server = cluster(build_app("n1", port, config), port)
+
+    start = time.time()
+    resp = httpx.post(
+        f"http://{server.host}:{server.port}/internal/replicate",
+        json={"key": "k", "value": "v1", "timestamp": 1.0, "node_id": "n1"},
+    )
+    elapsed = time.time() - start
+
+    assert resp.status_code == 200
+    assert elapsed < 0.2
+
+
+def test_fault_inject_delay_delays_replicate_ack_and_apply(cluster):
+    """A positive fault_inject_delay_seconds makes /internal/replicate
+    sleep before acknowledging *and* before applying the write -- both
+    the HTTP round trip and visibility of the new value are delayed by
+    (at least) that long, which is the whole mechanism the boundary-case
+    demo experiment relies on to widen the write-vs-read race window.
+    """
+    port = _free_port()
+    node = Node(host="127.0.0.1", port=port)
+    config = ClusterConfig(nodes=[node], default_w=1, default_r=1, timeout_seconds=2.0)
+    server = cluster(
+        build_app("n1", port, config, fault_inject_delay_seconds=0.3), port
+    )
+
+    start = time.time()
+    resp = httpx.post(
+        f"http://{server.host}:{server.port}/internal/replicate",
+        json={"key": "k", "value": "v1", "timestamp": 1.0, "node_id": "n1"},
+        timeout=2.0,
+    )
+    elapsed = time.time() - start
+
+    assert resp.status_code == 200
+    assert elapsed >= 0.3
+    entry = httpx.get(f"http://{server.host}:{server.port}/internal/kv/k").json()
+    assert entry["value"] == "v1"
+
+
 # --- ClusterConfig parsing --------------------------------------------------
 
 

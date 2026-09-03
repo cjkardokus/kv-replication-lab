@@ -39,4 +39,45 @@ Earlier runs of this sweep measured a small but nonzero rate here (roughly 1.2-1
 
 Both still measure at or near 0.00% run to run (`W=1,R=1` has shown a small nonzero rate on occasion; `W=2,R=3` has not, so far) -- run-to-run noise around a real floor, not two separate coincidences or a residual bug in the fix: **every write floods every peer unconditionally, regardless of W** (durability is fully decoupled from the ack-wait -- see the module docstring), and that flood completes in low single-digit milliseconds on localhost -- far faster than the ~250-330ms average gap between requests touching the same key at this benchmark's throughput (10,000 requests / 100 keys). By the time a subsequent read arrives, the write has almost always finished landing everywhere already, so neither config's real non-guarantee gets much chance to manifest. This was already known and documented for `W=1,R=1` specifically (see `experiments/leaderless_staleness_load_test.py`'s module comment) -- making the fan-out exact rather than margin-padded didn't shrink this effect, it *generalized* it: previously only `W=1`'s unconditional full flood was fast enough to hide behind loopback speed; now every W value floods unconditionally by design, so every non-guaranteed config inherits the same blind spot, not just `W=1,R=1`.
 
-Reproducing genuine leaderless staleness locally now needs the same intervention already scoped for `W=1,R=1`: shrinking the key pool (heavier same-key contention), injecting artificial per-peer replication delay, or real network latency (the planned EC2 stage) -- left undone here since it's a benchmark-realism change, not a coordinator-logic fix.
+Reproducing genuine leaderless staleness locally needs the same kind of intervention already scoped for `W=1,R=1`: shrinking the key pool (heavier same-key contention), injecting artificial per-peer replication delay, or real network latency (the planned EC2 stage). The second of those is now done, as a separate, clearly-labeled experiment -- see "Demonstrating the W+R boundary case" below. It's deliberately *not* folded into the sweep above: everything in that sweep (including this `W=2,R=3` row) measures the real coordinator logic under this benchmark's real, unmodified timing, and that row's `0.00%` is an honest report of what this lab's normal local conditions produce, blind spot and all.
+
+## Demonstrating the W+R boundary case
+
+The `W=2,R=3` row above is real, but it doesn't demonstrate the thing it was chosen to demonstrate: that `W+R<=N` configs are not guaranteed to avoid a disjoint write/read quorum, unlike every other config in the sweep. It measures `0.00%` here for the same reason `W=1,R=1` does (see above) -- not because the guarantee secretly holds, but because this benchmark's real replication is faster than this benchmark's real request timing can catch. That's a genuine local-testing blind spot, not evidence the boundary case doesn't exist.
+
+`leaderless/node.py` now has an opt-in, off-by-default fault-injection flag (`--fault-inject-delay-ms` / `FAULT_INJECT_REPLICATE_DELAY_MS`) purely to make this reproducible locally: it adds an artificial sleep to a node's `/internal/replicate` handler, before the write is applied, before that node acknowledges it. Disabled (the default, `0`), `/internal/replicate` is exactly `create_app()`'s stock handler, byte-for-byte -- every config in the sweep above, including `W=2,R=3`, ran with this completely off. It has no role in normal cluster behavior and is never driven by cluster config, only by a node process's own CLI flag/env var.
+
+`experiments/leaderless_boundary_case_demo.py` is a small, separate, standalone script (**not** part of `run_comparison.py`, and it does not touch that script or its sweep) that starts the same 5-node cluster with this flag enabled on a subset of the nodes, then runs the existing `W=2,R=3` load test against it. This is an artificially handicapped run, not a measurement of the real implementation under real load -- the same honesty standard as everywhere else in this document. It exists to demonstrate that the boundary case is real and reachable, not to characterize this project's actual local performance (the sweep above is what does that).
+
+### What was tried
+
+| Delayed nodes (of 5) | Delay/peer | `W=2,R=3` staleness | Elapsed | Failures |
+|---|---|---|---|---|
+| 5 (all) | 0ms | 0.00% | 38.6s | 1 |
+| 5 (all) | 200ms | 0.00% | 38.4s | 0 |
+| 5 (all) | 1000ms | 0.00% | 82.0s | 0 |
+| 2 | 300ms | 0.00% | 39.8s | 0 |
+| 3 | 300ms | 0.41% | 40.0s | 0 |
+| 3 | 800ms | 1.62% | 41.8s | 1 |
+| 4 | 800ms | 2.78% | 44.5s | 0 |
+| 4 | 800ms (repeat) | 3.19% | 45.9s | 0 |
+| **4 (default)** | **800ms (default)** | **2.59%** | **49.1s** | **2** |
+
+Delaying *every* node by the same fixed amount, at any size tried up to a full second, produced exactly `0.00%` every time -- not "still small", exactly zero. The reason is structural: `W=2` only waits for one peer ack (`needed=1`) beyond the coordinator's own local write. With every peer under an identical fixed delay, all four of a write's replicate calls finish in near lockstep, so the one ack that satisfies `needed=1` -- which is what lets the coordinator return success to the client, which is in turn what lets the load test record this write as ground truth to compare later reads against -- arrives at essentially the same instant every *other* peer also finishes. Delaying the whole cluster uniformly just moves the entire flood later together; it never opens a gap between "the client was told this write succeeded" and "this write has actually reached everywhere."
+
+Delaying only a subset of nodes breaks that symmetry, but the subset has to be large enough relative to `R`, not just nonzero. At 2 of 5 nodes delayed, staleness was *still* `0.00%`: the read path resolves its `R` responses by highest timestamp, not by requiring every sampled node to be current, so a read only sees stale data if *every one* of its `R=3` sampled nodes happens to still be behind -- and with only 2 nodes ever behind, that's structurally impossible (at least 1 of any 3 sampled nodes is always one of the always-current nodes, and its fresher timestamp always wins). Raising the delayed count to 3 -- one more than `R` can structurally guarantee coverage against -- is what actually produced nonzero staleness. Pushing to 4 delayed nodes at 800ms/peer landed on a robust, clearly nonzero, low-single-digit-percent rate across repeated runs (2.6-3.2%), without materially slowing the benchmark down (most writes still get their one required ack from a fast, undelayed node -- elapsed time stays close to the main sweep's ~44s for this config) or introducing meaningful new request failures.
+
+As a direct sanity check, `W=3,R=3` -- genuinely guaranteed, `3+3>5` -- was run against this exact same 4-delayed-nodes/800ms setup and stayed at `0.00%` (0 failures, 64.6s elapsed). Same fault conditions, same cluster, only the config changed: this confirms the nonzero rate above is specific to `W=2,R=3`'s real lack of a guarantee, not just "the cluster is flaky now that nodes are artificially slow."
+
+### Result
+
+Running `python3 -m experiments.leaderless_boundary_case_demo` (defaults: 4 of 5 nodes delayed, 800ms/peer) against `W=2,R=3`:
+
+```
+staleness rate:       2.59%  (173 stale / 6689 comparable reads)
+failures:              2  (reads: 2, writes: 0)
+elapsed:               49.1s
+total requests:        10000  (7017 reads, 2983 writes)
+```
+
+`2.59%` is not "the real staleness rate of `W=2,R=3`" -- it's a function of how much artificial delay and how many delayed nodes this particular run chose, both arbitrary knobs turned until the effect became visible. The result that matters isn't the specific number, it's that it's clearly, robustly, repeatably nonzero, while every genuinely-guaranteed config (including `W=3,R=3` under the identical fault conditions above) stays at `0.00%` regardless. That's the boundary case, made observable rather than just asserted.

@@ -4,8 +4,11 @@ Wraps common/server.py's app like leader_follower/leader.py does, but
 unlike that single-leader design, *every* node runs this same module --
 there's no dedicated leader, so any node can act as coordinator for any
 client request. This module overrides PUT /kv/{key} and GET /kv/{key}
-with coordinator behavior; DELETE, /internal/replicate, and /health are
-inherited from create_app() unchanged, same as a leader-follower node.
+with coordinator behavior; DELETE and /health are inherited from
+create_app() unchanged, same as a leader-follower node. /internal/replicate
+is also inherited unchanged *unless* this node was started with
+--fault-inject-delay-ms set (default: unset, meaning unchanged) -- see
+"Fault injection" below.
 
 Because every node is a coordinator, this module also adds one route
 create_app() doesn't have: GET /internal/kv/{key}, a raw local read with
@@ -85,6 +88,24 @@ Read path, per GET /kv/{key}:
      finish in the background rather than cancelled -- see
      QuorumCoordinator._gather for why cancelling them turned out to be
      the wrong call.
+
+Fault injection (--fault-inject-delay-ms, off by default):
+  This node's /internal/replicate can be given an artificial delay,
+  applied before it acknowledges a peer's replicated write, purely to
+  make an otherwise-too-fast-to-observe race reproducible on localhost --
+  see docs/results.md's "Demonstrating the W+R boundary case" section and
+  docs/AUDIT_FINDINGS.md's §2 for why this exists: on loopback, an
+  unconditional full-peer-flood write (see replicate_write above)
+  normally lands everywhere in low single-digit milliseconds, far faster
+  than this benchmark's real request-arrival rate, which makes a
+  genuinely non-guaranteed config (W+R<=N, e.g. W=2,R=3 on this lab's
+  5-node cluster) measure ~0% staleness locally even though nothing
+  guarantees that. This flag has NO role in normal cluster behavior --
+  it defaults to 0 (disabled), in which case /internal/replicate is
+  exactly create_app()'s stock handler, unmodified -- and it is never
+  driven by ClusterConfig/the cluster YAML, only by this process's own
+  CLI flag/env var, so it can never be silently enabled by cluster
+  config alone. See build_app() for where it's wired in.
 """
 
 from __future__ import annotations
@@ -106,7 +127,14 @@ import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from common.models import VersionedValue
-from common.server import KVResponse, PutRequest, PutResponse, create_app
+from common.server import (
+    KVResponse,
+    PutRequest,
+    PutResponse,
+    ReplicateRequest,
+    ReplicateResponse,
+    create_app,
+)
 from common.storage import KVStore
 
 logger = logging.getLogger(__name__)
@@ -475,11 +503,25 @@ class QuorumCoordinator:
 # --- App factory --------------------------------------------------------
 
 
-def build_app(node_id: str, own_port: int, config: ClusterConfig) -> FastAPI:
+def build_app(
+    node_id: str,
+    own_port: int,
+    config: ClusterConfig,
+    *,
+    fault_inject_delay_seconds: float = 0.0,
+) -> FastAPI:
     """Build a leaderless node app: common.server's app with PUT and GET
     /kv/{key} replaced by coordinator logic (see module docstring), plus
-    a new GET /internal/kv/{key} for peers' raw local reads. DELETE,
-    /internal/replicate, and /health are left as-is.
+    a new GET /internal/kv/{key} for peers' raw local reads. DELETE and
+    /health are left as-is.
+
+    `fault_inject_delay_seconds` is TEST/BENCHMARK-ONLY (see module
+    docstring's "Fault injection" section) and defaults to 0.0, meaning
+    completely disabled: /internal/replicate is then also left exactly
+    as-is, unmodified from create_app()'s stock handler. Passing a
+    positive value overrides that one route with a version that sleeps
+    for the given duration before acknowledging -- nothing else about
+    this node's behavior changes.
     """
     storage = KVStore()
     app = create_app(storage, node_id)
@@ -611,6 +653,38 @@ def build_app(node_id: str, own_port: int, config: ClusterConfig) -> FastAPI:
             node_id=entry.node_id,
         )
 
+    if fault_inject_delay_seconds > 0:
+        # TEST/BENCHMARK ONLY -- see module docstring's "Fault injection"
+        # section and build_app()'s own docstring. Only reached when a
+        # caller explicitly opts in; otherwise this whole block doesn't
+        # run and /internal/replicate stays create_app()'s stock,
+        # unmodified handler.
+        app.router.routes = [
+            route
+            for route in app.router.routes
+            if not (
+                getattr(route, "path", None) == "/internal/replicate"
+                and "POST" in getattr(route, "methods", ())
+            )
+        ]
+
+        @app.post("/internal/replicate", response_model=ReplicateResponse)
+        async def replicate_with_injected_delay(body: ReplicateRequest, request: Request) -> ReplicateResponse:
+            logger.info(
+                "method=%s path=%s key=%s [fault-injected delay=%.3fs]",
+                request.method, request.url.path, body.key, fault_inject_delay_seconds,
+            )
+            # The delay runs *before* applying the write, so a peer that
+            # hasn't woken up yet genuinely doesn't have it -- a read
+            # landing on this node during the sleep sees the old value
+            # (or 404), exactly the race this flag exists to widen. This
+            # otherwise mirrors create_app()'s replicate() exactly.
+            await asyncio.sleep(fault_inject_delay_seconds)
+            applied = storage.put(
+                body.key, body.value, timestamp=body.timestamp, node_id=body.node_id
+            )
+            return ReplicateResponse(applied=applied)
+
     return app
 
 
@@ -670,7 +744,26 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "size). Defaults to the value in the config YAML."
         ),
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--fault-inject-delay-ms",
+        type=float,
+        default=float(os.environ.get("FAULT_INJECT_REPLICATE_DELAY_MS", "0")),
+        help=(
+            "TEST/BENCHMARK ONLY: artificial delay in milliseconds, "
+            "injected before this node acknowledges a peer's "
+            "/internal/replicate call -- exists purely to make an "
+            "otherwise-too-fast-to-observe replication race reproducible "
+            "on localhost (see docs/results.md's 'Demonstrating the W+R "
+            "boundary case' section). Has no role in normal cluster "
+            "behavior. Defaults to 0 (disabled -- /internal/replicate is "
+            "then create_app()'s stock, unmodified handler; env: "
+            "FAULT_INJECT_REPLICATE_DELAY_MS)."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.fault_inject_delay_ms < 0:
+        parser.error("--fault-inject-delay-ms must be >= 0")
+    return args
 
 
 def _resolve_config(args: argparse.Namespace) -> ClusterConfig:
@@ -686,7 +779,12 @@ def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     args = _parse_args(argv)
     config = _resolve_config(args)
-    app = build_app(args.node_id, args.port, config)
+    app = build_app(
+        args.node_id,
+        args.port,
+        config,
+        fault_inject_delay_seconds=args.fault_inject_delay_ms / 1000.0,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 
