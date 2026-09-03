@@ -12,13 +12,18 @@ there's no forwarding, no ack-counting, no quorum logic here. That
 behavior is layered on top by leader_follower/leader.py,
 leader_follower/follower.py, and leaderless/node.py, which import
 create_app() and build on it.
+
+Also provides replace_route(), a small helper those callers (and tests
+that build minimal stand-in peer/follower apps) use to override one of
+create_app()'s routes with their own strategy-specific handler -- see
+that function's docstring for why this is necessary, not just tidy.
 """
 
 from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import Any, Iterable
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
@@ -106,6 +111,44 @@ class HealthResponse(BaseModel):
 
     node_id: str
     key_count: int
+
+
+# --- Route helpers ---------------------------------------------------------
+
+
+def replace_route(app: FastAPI, path: str, methods: Iterable[str]) -> None:
+    """Drop any route already registered on `app` at `path` whose HTTP
+    methods overlap `methods`, so a caller can register its own handler
+    for that path/method combination afterward without the original
+    silently still matching first.
+
+    Necessary, not just tidy: Starlette matches routes in registration
+    order, so simply adding a new route for a path/method combination
+    that's already registered does *not* shadow the original -- the
+    original, registered first, would still win. This is how
+    leader_follower/leader.py and leaderless/node.py override a subset
+    of the generic KV HTTP surface create_app() provides with their own
+    strategy-specific logic (replicate-then-ack-count writes, quorum
+    reads/writes, an optional fault-injected replicate delay), and how
+    tests build minimal stand-ins for one node with a single overridden
+    route (e.g. a slow, malformed, or otherwise misbehaving peer)
+    without reimplementing create_app() from scratch.
+
+    `methods` may be a single method's name, several, or all of a
+    route's methods at once -- a route matches (and is dropped) if its
+    own methods overlap `methods` at all, the same as passing e.g.
+    `{"PUT", "GET"}` to drop both a PUT and a GET route on the same path
+    in one call.
+    """
+    wanted = set(methods)
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == path
+            and set(getattr(route, "methods", ())) & wanted
+        )
+    ]
 
 
 # --- App factory ---------------------------------------------------------

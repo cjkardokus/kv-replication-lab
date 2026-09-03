@@ -47,14 +47,16 @@ import uvicorn
 from fastapi import FastAPI
 from starlette.responses import PlainTextResponse
 
-from common.server import ReplicateResponse, create_app
+from common.replication_client import (
+    _CLIENT_MAX_CONNECTIONS,
+    _CLIENT_MAX_KEEPALIVE_CONNECTIONS,
+)
+from common.server import ReplicateResponse, create_app, replace_route
 from common.storage import KVStore
 from leader_follower.follower import build_app as build_follower_app
 from leader_follower.leader import (
     ClusterConfig,
     Follower,
-    _CLIENT_MAX_CONNECTIONS,
-    _CLIENT_MAX_KEEPALIVE_CONNECTIONS,
     _parse_args,
     _resolve_config,
     build_app as build_leader_app,
@@ -133,14 +135,9 @@ def _slow_follower_app(node_id: str, delay_seconds: float) -> FastAPI:
     storage = KVStore()
     app = create_follower_with_storage(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/internal/replicate"
-            and "POST" in getattr(route, "methods", ())
-        )
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/replicate", {"POST"})
 
     @app.post("/internal/replicate", response_model=ReplicateResponse)
     def slow_replicate(body: dict) -> ReplicateResponse:  # type: ignore[type-arg]
@@ -168,14 +165,9 @@ def _malformed_follower_app(node_id: str) -> FastAPI:
     storage = KVStore()
     app = create_follower_with_storage(node_id, storage)
 
-    app.router.routes = [
-        route
-        for route in app.router.routes
-        if not (
-            getattr(route, "path", None) == "/internal/replicate"
-            and "POST" in getattr(route, "methods", ())
-        )
-    ]
+    # See common.server.replace_route's docstring for why this is
+    # necessary, not just tidy.
+    replace_route(app, "/internal/replicate", {"POST"})
 
     @app.post("/internal/replicate")
     def malformed_replicate(body: dict) -> PlainTextResponse:  # type: ignore[type-arg]
@@ -368,7 +360,12 @@ def test_build_app_pool_size_is_module_constant_regardless_of_config():
     what build_app() actually *requests*, via the public httpx.Limits
     object it constructs and passes in -- not on httpx/httpcore's
     internal representation of those limits, which isn't public API and
-    could change independently of this project's own code.
+    could change independently of this project's own code. Patched at
+    common.replication_client.httpx.AsyncClient, not
+    leader_follower.leader's own reference to httpx, since that's where
+    the actual client construction lives (build_app() calls
+    common.replication_client.build_replication_client(), it doesn't
+    build the client itself) -- see docs/AUDIT_FINDINGS.md's §5.
     """
     followers = [
         Follower(host="127.0.0.1", port=9001),
@@ -376,7 +373,7 @@ def test_build_app_pool_size_is_module_constant_regardless_of_config():
         Follower(host="127.0.0.1", port=9003),
     ]
 
-    with patch("leader_follower.leader.httpx.AsyncClient") as mock_async_client:
+    with patch("common.replication_client.httpx.AsyncClient") as mock_async_client:
         for ack_required in range(len(followers) + 1):  # 0..3, every valid value
             config = ClusterConfig(
                 followers=followers, ack_required=ack_required, timeout_seconds=1.0
