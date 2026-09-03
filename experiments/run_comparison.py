@@ -20,12 +20,18 @@ cluster (config/leader_follower_cluster.yaml), restarting the leader
 ACK_REQUIRED_SWEEP.
 
 Leaderless: five W/R combinations against the existing 5-node cluster
-(config/leaderless_cluster.yaml), all sent as per-request overrides
-against one cluster started once -- W/R don't require a restart between
-configs, unlike ack_required -- see LEADERLESS_WR_SWEEP for why each of
-the five was chosen (two guaranteed-consistent extremes, the
-industry-standard majority quorum, and one deliberately on the W+R=N
-boundary to make the rule's edge visible rather than just guaranteed).
+(config/leaderless_cluster.yaml), sent as per-request overrides -- the
+5-node cluster is restarted fresh for each config, exactly like the
+leader-follower sweep above, so every config in both sweeps starts from
+an empty KVStore and neither strategy's later configs can inherit an
+earlier config's state (see docs/AUDIT_FINDINGS.md's §7: this used to
+restart leader-follower per config but run all five leaderless configs
+against one continuously-live cluster, an asymmetry in measurement rigor
+between the two sweeps, not a deliberate design choice). See
+LEADERLESS_WR_SWEEP for why each of the five was chosen (two
+guaranteed-consistent extremes, the industry-standard majority quorum,
+and one deliberately on the W+R=N boundary to make the rule's edge
+visible rather than just guaranteed).
 
 A configuration whose node processes don't become healthy in time is
 logged clearly and skipped -- the rest of the sweep continues rather
@@ -67,6 +73,7 @@ from pathlib import Path
 import httpx
 
 from experiments import leaderless_staleness_load_test, staleness_load_test
+from experiments._load_test_common import DEFAULT_SEED
 from experiments._results_doc import RESULTS_HEADER, RESULTS_HEADER_MARKER, replace_section
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -323,34 +330,25 @@ async def run_leader_follower_configs(client: httpx.AsyncClient) -> list[Outcome
 
 async def run_leaderless_configs(client: httpx.AsyncClient) -> list[Outcome]:
     outcomes: list[Outcome] = []
-    nodes: list[SpawnedNode] = []
-
-    print("\n--- leaderless: starting cluster (5 nodes) ---")
-    try:
-        for i, port in enumerate(LEADERLESS_NODE_PORTS, start=1):
-            nodes.append(
-                _spawn(
-                    "leaderless.node",
-                    ["--node-id", f"node{i}", "--port", str(port)],
-                    f"leaderless_node{i}",
-                    LEADERLESS_HOST,
-                    port,
-                )
-            )
-        await _wait_for_all_healthy(client, nodes)
-        print("--- leaderless: cluster healthy ---")
-    except Exception as exc:  # noqa: BLE001 -- see run_leader_follower_configs
-        print(f"!!! leaderless cluster SKIPPED (all {len(LEADERLESS_WR_SWEEP)} configs): {exc} !!!")
-        _stop_all(nodes)
-        return [
-            ConfigError(strategy="leaderless", label=label, reason=str(exc))
-            for label, _, _ in LEADERLESS_WR_SWEEP
-        ]
 
     for label, w, r in LEADERLESS_WR_SWEEP:
-        print(f"\n--- leaderless [{label}]: running load test ---")
+        print(f"\n--- leaderless [{label}]: starting cluster (5 nodes) ---")
+        slug = _slug(label)
+        nodes: list[SpawnedNode] = []
         try:
-            slug = _slug(label)
+            for i, port in enumerate(LEADERLESS_NODE_PORTS, start=1):
+                nodes.append(
+                    _spawn(
+                        "leaderless.node",
+                        ["--node-id", f"node{i}", "--port", str(port)],
+                        f"leaderless_{slug}_node{i}",
+                        LEADERLESS_HOST,
+                        port,
+                    )
+                )
+            await _wait_for_all_healthy(client, nodes)
+
+            print(f"--- leaderless [{label}]: cluster healthy, running load test ---")
             result = await leaderless_staleness_load_test.run_load_test(
                 w=w,
                 r=r,
@@ -359,30 +357,30 @@ async def run_leaderless_configs(client: httpx.AsyncClient) -> list[Outcome]:
                 output_log_path=LOAD_TEST_LOG_DIR / f"leaderless_{slug}_stale.jsonl",
                 failure_log_path=LOAD_TEST_LOG_DIR / f"leaderless_{slug}_failures.jsonl",
             )
-        except Exception as exc:  # noqa: BLE001 -- one bad config must not
-            # cost the rest of the sweep against this same live cluster.
+            outcomes.append(
+                ConfigResult(
+                    strategy="leaderless",
+                    label=label,
+                    elapsed=result.elapsed,
+                    staleness_rate=result.stats.staleness_rate,
+                    total_failures=result.stats.total_failures,
+                    total_requests=result.stats.total_requests,
+                )
+            )
+            print(
+                f"--- leaderless [{label}]: done -- "
+                f"staleness={result.stats.staleness_rate:.2f}% "
+                f"failures={result.stats.total_failures} "
+                f"elapsed={result.elapsed:.1f}s ---"
+            )
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad: any
+            # failure in this config's startup or run must not abort the
+            # rest of the sweep (see module docstring).
             print(f"!!! leaderless [{label}] SKIPPED: {exc} !!!")
             outcomes.append(ConfigError(strategy="leaderless", label=label, reason=str(exc)))
-            continue
+        finally:
+            _stop_all(nodes)
 
-        outcomes.append(
-            ConfigResult(
-                strategy="leaderless",
-                label=label,
-                elapsed=result.elapsed,
-                staleness_rate=result.stats.staleness_rate,
-                total_failures=result.stats.total_failures,
-                total_requests=result.stats.total_requests,
-            )
-        )
-        print(
-            f"--- leaderless [{label}]: done -- "
-            f"staleness={result.stats.staleness_rate:.2f}% "
-            f"failures={result.stats.total_failures} "
-            f"elapsed={result.elapsed:.1f}s ---"
-        )
-
-    _stop_all(nodes)
     return outcomes
 
 
@@ -422,18 +420,73 @@ def _print_report(outcomes: list[Outcome]) -> None:
         print("!" * width)
 
 
+# Fixed methodology notes, printed after the table in every generated
+# report -- these describe how the measurement itself is constructed
+# (harness mechanics, seeding), not an interpretation of what any
+# particular run's numbers mean. That distinction is what keeps this
+# from being _KNOWN_CHARACTERISTICS_NOTES under a new name (see
+# docs/AUDIT_FINDINGS.md's §6 for why that was removed): nothing below
+# cites a result-dependent figure that a future code change could make
+# stale without this text being touched -- it's true regardless of what
+# the table above shows. Interpretation of the actual numbers lives in
+# README.md's "Results" section instead, updated by hand when it goes
+# out of date.
+_METHODOLOGY_NOTES = (
+    "### Methodology notes\n"
+    "\n"
+    "**ack_required=0 vs. W=1,R=1 aren't apples-to-apples.** Both are "
+    "each strategy's weakest/no-durability-wait config, but this harness "
+    "gives them very different coordinator load: every leader-follower "
+    "write goes through the one leader process (100% of write traffic, "
+    "one process), while every leaderless write picks its coordinator by "
+    "round robin across all 5 nodes (`NodeRotation` in "
+    "`experiments/leaderless_staleness_load_test.py`, roughly 20% of "
+    "write traffic per process). `ack_required=0`'s replicate fan-out is "
+    "therefore concentrated on a single process; `W=1`'s "
+    "architecturally-equivalent fan-out is split roughly five ways. This "
+    "is a real, structural difference in what this harness measures for "
+    "each config, not just \"there may be some asymmetry here\" -- it "
+    "plausibly explains part of the gap between the two configs' "
+    "results, independent of anything about the two replication "
+    "strategies' actual protocols. See docs/AUDIT_FINDINGS.md's §9.\n"
+    "\n"
+    f"**Runs are seeded (default seed: {DEFAULT_SEED}; override with "
+    "--seed).** Every config's full sequence of per-request decisions -- "
+    "which key, read vs. write, which follower/read-coordinator -- is "
+    "precomputed before that config's timed portion starts, so the same "
+    "seed produces the exact same sequence of decisions on every run "
+    "(see `experiments/_load_test_common.py`'s `generate_request_plan`). "
+    "This does **not** make a config's results identical run to run: "
+    "real request timing/scheduling -- whether a read's real arrival "
+    "races a write's real in-flight replication -- is not seeded and "
+    "cannot be made deterministic. Measured directly (3 runs each, same "
+    f"seed={DEFAULT_SEED}, nothing else changed): leader-follower "
+    "`ack_required=2` ranged 13.12-13.31% staleness, 17-30 failures "
+    "(elapsed 38.3-42.1s); leaderless `W=1,R=1` measured exactly 0.00% "
+    "staleness, 0 failures, all three runs (elapsed 23.1-24.5s) -- "
+    "consistent with `W=1,R=1` being a genuine structural blind spot at "
+    "this scale (see the boundary-case-demo section) rather than "
+    "something timing-sensitive enough to show variance here. Treat any "
+    "single run's numbers, including the table above, as one sample "
+    "from around that range, not an exact, repeatable figure -- tighter "
+    "for some configs than others. See docs/AUDIT_FINDINGS.md's §8."
+)
+
+
 def _write_markdown_report(outcomes: list[Outcome], path: Path) -> None:
     """Write this run's main-sweep table into docs/results.md's own
     marked section (see experiments/_results_doc.py), leaving any other
     section already in the file -- e.g.
     leaderless_boundary_case_demo.py's -- untouched.
 
-    Mechanical only, by design: a table, a run timestamp, and a pointer
-    to the raw JSONL logs -- no hand-authored analysis of *why* the
-    numbers look the way they do. That used to live here too, hardcoded
-    as a fixed string reproduced in every report regardless of what the
-    table above it actually said -- see docs/AUDIT_FINDINGS.md's §6 for
-    why that turned out to be a bad idea (git history:
+    Mostly mechanical, by design: a table, a run timestamp, and a
+    pointer to the raw JSONL logs, plus _METHODOLOGY_NOTES above (fixed
+    facts about how the measurement itself works, not an interpretation
+    of what any particular run's numbers mean -- see that constant's own
+    comment for the distinction). Interpretation used to live here too,
+    hardcoded as a fixed string reproduced in every report regardless of
+    what the table above it actually said -- see docs/AUDIT_FINDINGS.md's
+    §6 for why that turned out to be a bad idea (git history:
     _KNOWN_CHARACTERISTICS_NOTES, removed) and README.md's "Results"
     section for where that analysis lives now instead.
     """
@@ -467,6 +520,8 @@ def _write_markdown_report(outcomes: list[Outcome], path: Path) -> None:
         lines += ["| Strategy | Config | Reason |", "|---|---|---|"]
         for e in errors:
             lines.append(f"| {e.strategy} | {e.label} | {e.reason} |")
+
+    lines += ["", _METHODOLOGY_NOTES]
 
     replace_section(path, RESULTS_HEADER_MARKER, RESULTS_HEADER)
     replace_section(path, "main-sweep", "\n".join(lines))
