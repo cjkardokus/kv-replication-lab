@@ -36,6 +36,17 @@ Approach
   the key, or has an older timestamp than the snapshot, is stale; a
   follower with an equal or newer timestamp is not (it may simply
   reflect a write this script hasn't caught up to itself).
+- "Random" above is seeded and reproducible by default (--seed,
+  default experiments._load_test_common.DEFAULT_SEED): the full
+  sequence of read/write-mix, key, and follower decisions for the
+  whole run is precomputed up front, before any request is issued, so
+  a fixed seed produces the exact same sequence of decisions every
+  time regardless of how the concurrent workers below happen to
+  interleave -- see generate_request_plan(). Real timing/scheduling
+  stays unseeded; only *which decision* each request makes is
+  reproducible, not *when* it runs, so staleness numbers can still
+  vary run to run under the same seed (see docs/results.md's
+  methodology note for measured variance).
 - Every request is also classified as succeeded or failed, independent
   of staleness: a non-2xx response (status code recorded), a timeout,
   or a connection error all count as a failure rather than a stale
@@ -68,16 +79,18 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import random
 import time
 from pathlib import Path
 
 import httpx
 
 from experiments._load_test_common import (
+    DEFAULT_SEED,
     GlobalCounter,
     LoadTestResult,
+    RequestPlan,
     SourceOfTruth,
     Stats,
     _classify_exception,
@@ -85,6 +98,8 @@ from experiments._load_test_common import (
     _record_failure,
     _record_stale,
     _write_jsonl,
+    generate_request_plan,
+    split_plan,
 )
 from leader_follower.leader import ClusterConfig, Follower
 
@@ -139,8 +154,8 @@ async def _do_write(
     source_of_truth: SourceOfTruth,
     leader_node_id: str,
     stats: Stats,
+    key: str,
 ) -> None:
-    key = random.choice(KEYS)
     value = await counter.next_value()
 
     try:
@@ -179,13 +194,11 @@ async def _do_write(
 async def _do_read(
     client: httpx.AsyncClient,
     source_of_truth: SourceOfTruth,
-    followers: list[Follower],
+    follower: Follower,
     follower_node_ids: dict[Follower, str],
     stats: Stats,
+    key: str,
 ) -> None:
-    key = random.choice(KEYS)
-    follower = random.choice(followers)
-
     expected_before = await source_of_truth.snapshot(key)
     if expected_before is None:
         # No write has completed for this key yet -- nothing to compare
@@ -232,7 +245,7 @@ async def _do_read(
 
 
 async def run_worker(
-    num_requests: int,
+    plan_chunk: list[RequestPlan],
     client: httpx.AsyncClient,
     counter: GlobalCounter,
     source_of_truth: SourceOfTruth,
@@ -241,14 +254,15 @@ async def run_worker(
     leader_node_id: str,
 ) -> Stats:
     stats = Stats()
-    for _ in range(num_requests):
+    for item in plan_chunk:
         stats.total_requests += 1
-        if random.random() < READ_FRACTION:
+        if item.is_read:
             stats.total_reads += 1
-            await _do_read(client, source_of_truth, followers, follower_node_ids, stats)
+            follower = followers[item.read_target_index]
+            await _do_read(client, source_of_truth, follower, follower_node_ids, stats, item.key)
         else:
             stats.total_writes += 1
-            await _do_write(client, counter, source_of_truth, leader_node_id, stats)
+            await _do_write(client, counter, source_of_truth, leader_node_id, stats, item.key)
     return stats
 
 
@@ -257,6 +271,7 @@ async def run_worker(
 
 async def run_load_test(
     *,
+    seed: int = DEFAULT_SEED,
     verbose: bool = True,
     write_logs: bool = True,
     output_log_path: Path = OUTPUT_LOG_PATH,
@@ -265,6 +280,15 @@ async def run_load_test(
     """Run the full staleness load test against an already-running
     leader-follower cluster (see module docstring) and return the
     results.
+
+    `seed` determines this run's precomputed per-request decisions (key
+    selection, read/write mix, which follower each read targets) -- see
+    experiments._load_test_common.generate_request_plan. Defaults to
+    DEFAULT_SEED, so every standard run is reproducible unless a caller
+    deliberately overrides it. Real timing/scheduling stays unseeded --
+    only *which decision* a request makes is made reproducible, not
+    *when* it runs, so this alone doesn't make staleness numbers
+    identical run to run under the same seed.
 
     `verbose` controls whether progress/summary text is printed --
     a caller driving several runs back-to-back (run_comparison.py)
@@ -281,6 +305,16 @@ async def run_load_test(
     if not followers:
         raise SystemExit(f"no followers configured in {CONFIG_PATH}")
 
+    # Precomputed before the timed portion starts (see
+    # generate_request_plan's docstring for why that's required for
+    # `seed` to actually be reproducible, not just a nicety) -- a plain
+    # synchronous loop, no I/O, no concurrency, so it costs real time
+    # but none of it counts toward `elapsed` below.
+    plan = generate_request_plan(
+        TOTAL_REQUESTS, KEYS, len(followers), read_fraction=READ_FRACTION, seed=seed
+    )
+    plan_chunks = split_plan(plan, NUM_WORKERS)
+
     limits = httpx.Limits(
         max_connections=NUM_WORKERS * 2, max_keepalive_connections=NUM_WORKERS * 2
     )
@@ -293,21 +327,18 @@ async def run_load_test(
         counter = GlobalCounter()
         source_of_truth = SourceOfTruth()
 
-        # Split TOTAL_REQUESTS as evenly as possible across NUM_WORKERS.
-        base, remainder = divmod(TOTAL_REQUESTS, NUM_WORKERS)
-        worker_loads = [base + (1 if i < remainder else 0) for i in range(NUM_WORKERS)]
-
         if verbose:
             print(
                 f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
                 f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes) "
-                f"against leader {LEADER_URL} and {len(followers)} followers..."
+                f"against leader {LEADER_URL} and {len(followers)} followers "
+                f"(seed={seed})..."
             )
         start = time.time()
         results = await asyncio.gather(
             *(
                 run_worker(
-                    load,
+                    chunk,
                     client,
                     counter,
                     source_of_truth,
@@ -315,7 +346,7 @@ async def run_load_test(
                     follower_node_ids,
                     leader_node_id,
                 )
-                for load in worker_loads
+                for chunk in plan_chunks
             )
         )
         elapsed = time.time() - start
@@ -336,8 +367,27 @@ async def run_load_test(
     return LoadTestResult(stats=stats, elapsed=elapsed)
 
 
-async def main() -> None:
-    await run_load_test()
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the leader-follower staleness load test."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=(
+            "Seed for this run's precomputed per-request decisions (key "
+            "selection, read/write mix, which follower each read "
+            "targets) -- real timing/scheduling stays unseeded "
+            f"regardless (default: {DEFAULT_SEED})."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    await run_load_test(seed=args.seed)
 
 
 if __name__ == "__main__":

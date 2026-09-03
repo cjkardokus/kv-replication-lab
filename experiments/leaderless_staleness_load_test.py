@@ -51,6 +51,19 @@ Approach
   key, or returns an older timestamp than the snapshot, is stale; equal
   or newer is not (it may simply reflect a write this script hasn't
   caught up to itself).
+- "Random" above is seeded and reproducible by default (--seed,
+  default experiments._load_test_common.DEFAULT_SEED): the full
+  sequence of read/write-mix, key, and read-coordinator decisions for
+  the whole run is precomputed up front, before any request is issued,
+  so a fixed seed produces the exact same sequence of decisions every
+  time regardless of how the concurrent workers below happen to
+  interleave -- see generate_request_plan(). Write-coordinator
+  selection (NodeRotation, round robin) is unaffected -- it was already
+  fully deterministic, not random. Real timing/scheduling stays
+  unseeded; only *which decision* each request makes is reproducible,
+  not *when* it runs, so staleness numbers can still vary run to run
+  under the same seed (see docs/results.md's methodology note for
+  measured variance).
 - Every request is also classified as succeeded or failed, independent
   of staleness: a non-2xx response (status code recorded, including a
   503 when a coordinator can't reach quorum in time), a timeout, or a
@@ -88,16 +101,18 @@ Run:
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import random
 import time
 from pathlib import Path
 
 import httpx
 
 from experiments._load_test_common import (
+    DEFAULT_SEED,
     GlobalCounter,
     LoadTestResult,
+    RequestPlan,
     SourceOfTruth,
     Stats,
     _classify_exception,
@@ -105,6 +120,8 @@ from experiments._load_test_common import (
     _record_failure,
     _record_stale,
     _write_jsonl,
+    generate_request_plan,
+    split_plan,
 )
 from leaderless.node import ClusterConfig, Node
 
@@ -200,9 +217,9 @@ async def _do_write(
     rotation: NodeRotation,
     node_ids: dict[Node, str],
     stats: Stats,
+    key: str,
     w: int | None = None,
 ) -> None:
-    key = random.choice(KEYS)
     value = await counter.next_value()
     coordinator = await rotation.next_node()
     base_url = f"http://{coordinator.host}:{coordinator.port}"
@@ -252,16 +269,12 @@ async def _do_write(
 async def _do_read(
     client: httpx.AsyncClient,
     source_of_truth: SourceOfTruth,
-    nodes: list[Node],
+    coordinator: Node,
     node_ids: dict[Node, str],
     stats: Stats,
+    key: str,
     r: int | None = None,
 ) -> None:
-    key = random.choice(KEYS)
-    # Independent random draw per read, not the shared write rotation --
-    # see module docstring.
-    coordinator = random.choice(nodes)
-
     expected_before = await source_of_truth.snapshot(key)
     if expected_before is None:
         # No write has completed for this key yet -- nothing to compare
@@ -318,7 +331,7 @@ async def _do_read(
 
 
 async def run_worker(
-    num_requests: int,
+    plan_chunk: list[RequestPlan],
     client: httpx.AsyncClient,
     counter: GlobalCounter,
     source_of_truth: SourceOfTruth,
@@ -329,14 +342,15 @@ async def run_worker(
     r: int | None = None,
 ) -> Stats:
     stats = Stats()
-    for _ in range(num_requests):
+    for item in plan_chunk:
         stats.total_requests += 1
-        if random.random() < READ_FRACTION:
+        if item.is_read:
             stats.total_reads += 1
-            await _do_read(client, source_of_truth, nodes, node_ids, stats, r)
+            coordinator = nodes[item.read_target_index]
+            await _do_read(client, source_of_truth, coordinator, node_ids, stats, item.key, r)
         else:
             stats.total_writes += 1
-            await _do_write(client, counter, source_of_truth, rotation, node_ids, stats, w)
+            await _do_write(client, counter, source_of_truth, rotation, node_ids, stats, item.key, w)
     return stats
 
 
@@ -347,6 +361,7 @@ async def run_load_test(
     *,
     w: int | None = None,
     r: int | None = None,
+    seed: int = DEFAULT_SEED,
     verbose: bool = True,
     write_logs: bool = True,
     output_log_path: Path = OUTPUT_LOG_PATH,
@@ -358,7 +373,15 @@ async def run_load_test(
     `w`/`r` override the cluster's configured default_w/default_r for
     every request this run issues, via the same query params
     leaderless/node.py's PUT/GET already accept -- left as None to use
-    whatever the cluster is configured with. `verbose` controls whether
+    whatever the cluster is configured with. `seed` determines this
+    run's precomputed per-request decisions (key selection, read/write
+    mix, which node each read's coordinator is) -- see
+    experiments._load_test_common.generate_request_plan. Defaults to
+    DEFAULT_SEED, so every standard run is reproducible unless a caller
+    deliberately overrides it. Real timing/scheduling stays unseeded --
+    only *which decision* a request makes is made reproducible, not
+    *when* it runs, so this alone doesn't make staleness numbers
+    identical run to run under the same seed. `verbose` controls whether
     progress/summary text is printed -- a caller driving several runs
     back-to-back (run_comparison.py) wants its own concise progress line
     instead of this script's full per-run summary. `write_logs` controls
@@ -373,6 +396,16 @@ async def run_load_test(
     if not nodes:
         raise SystemExit(f"no nodes configured in {CONFIG_PATH}")
 
+    # Precomputed before the timed portion starts (see
+    # generate_request_plan's docstring for why that's required for
+    # `seed` to actually be reproducible, not just a nicety) -- a plain
+    # synchronous loop, no I/O, no concurrency, so it costs real time
+    # but none of it counts toward `elapsed` below.
+    plan = generate_request_plan(
+        TOTAL_REQUESTS, KEYS, len(nodes), read_fraction=READ_FRACTION, seed=seed
+    )
+    plan_chunks = split_plan(plan, NUM_WORKERS)
+
     limits = httpx.Limits(
         max_connections=NUM_WORKERS * 2, max_keepalive_connections=NUM_WORKERS * 2
     )
@@ -385,23 +418,19 @@ async def run_load_test(
         source_of_truth = SourceOfTruth()
         rotation = NodeRotation(nodes)
 
-        # Split TOTAL_REQUESTS as evenly as possible across NUM_WORKERS.
-        base, remainder = divmod(TOTAL_REQUESTS, NUM_WORKERS)
-        worker_loads = [base + (1 if i < remainder else 0) for i in range(NUM_WORKERS)]
-
         if verbose:
             print(
                 f"starting {NUM_WORKERS} workers, {TOTAL_REQUESTS} total requests "
                 f"({READ_FRACTION:.0%} reads / {1 - READ_FRACTION:.0%} writes), "
                 f"round-robin coordinator across {len(nodes)} nodes "
                 f"(w={w if w is not None else config.default_w}, "
-                f"r={r if r is not None else config.default_r})..."
+                f"r={r if r is not None else config.default_r}, seed={seed})..."
             )
         start = time.time()
         results = await asyncio.gather(
             *(
-                run_worker(load, client, counter, source_of_truth, rotation, nodes, node_ids, w, r)
-                for load in worker_loads
+                run_worker(chunk, client, counter, source_of_truth, rotation, nodes, node_ids, w, r)
+                for chunk in plan_chunks
             )
         )
         elapsed = time.time() - start
@@ -422,8 +451,27 @@ async def run_load_test(
     return LoadTestResult(stats=stats, elapsed=elapsed)
 
 
-async def main() -> None:
-    await run_load_test()
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the leaderless staleness load test."
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=(
+            "Seed for this run's precomputed per-request decisions (key "
+            "selection, read/write mix, which node each read's "
+            "coordinator is) -- real timing/scheduling stays unseeded "
+            f"regardless (default: {DEFAULT_SEED})."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+async def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    await run_load_test(seed=args.seed)
 
 
 if __name__ == "__main__":

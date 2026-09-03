@@ -1,24 +1,32 @@
 """Shared machinery for experiments/staleness_load_test.py and
-experiments/leaderless_staleness_load_test.py: per-worker stat tracking,
-the shared write-value/source-of-truth state passed into workers,
-failure classification/recording, and the printed/JSONL reporting.
+experiments/leaderless_staleness_load_test.py: seeded per-request
+decision planning, per-worker stat tracking, the shared write-value/
+source-of-truth state passed into workers, failure classification/
+recording, and the printed/JSONL reporting.
 
-Extracted from those two scripts, which had all of this duplicated
-near-verbatim -- see docs/AUDIT_FINDINGS.md's §4. This was a mechanical
-extraction (pure code motion): every piece here is unchanged from at
-least one of the two scripts' own copies, except two spots that
-genuinely differed between them and are now parameters instead --
-`_record_stale`'s `node_id_field` (each strategy calls the node a stale
-read landed on by a different name: "follower_node_id" vs.
+Most of this was extracted from those two scripts, which had it
+duplicated near-verbatim -- see docs/AUDIT_FINDINGS.md's §4. That part
+was a mechanical extraction (pure code motion): every such piece is
+unchanged from at least one of the two scripts' own copies, except two
+spots that genuinely differed between them and are now parameters
+instead -- `_record_stale`'s `node_id_field` (each strategy calls the
+node a stale read landed on by a different name: "follower_node_id" vs.
 "coordinator_node_id") and `_print_summary`'s `title` (the printed
-banner text). Everything else was byte-identical between the two
-scripts already.
+banner text).
+
+The request-planning machinery (RequestPlan, generate_request_plan,
+split_plan, DEFAULT_SEED) is not an extraction -- it's new, shared
+logic implementing docs/AUDIT_FINDINGS.md's §8: making a run's
+per-request decisions (not real timing) reproducible under a fixed
+seed. See generate_request_plan's own docstring for why this has to be
+precomputed up front rather than seeded lazily.
 
 Genuinely strategy-specific, and deliberately *not* here: coordinator
 selection (leader-follower's fixed leader URL vs. leaderless's
-NodeRotation/random peer choice), node-id discovery (`discover_node_ids`
-et al. -- typed against each strategy's own `Follower`/`Node` address
-class), and each script's own `_do_write`/`_do_read` HTTP calls.
+NodeRotation/random read-coordinator choice), node-id discovery
+(`discover_node_ids` et al. -- typed against each strategy's own
+`Follower`/`Node` address class), and each script's own
+`_do_write`/`_do_read` HTTP calls.
 
 Not a standalone entry point -- imported by the two load-test scripts
 above, never run directly (hence the leading underscore, this project's
@@ -31,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import random
 import statistics
 import time
 from collections import Counter
@@ -39,6 +48,119 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+
+# Fixed default so every standard sweep run is reproducible (see
+# generate_request_plan below) unless a caller deliberately overrides
+# it -- e.g. to confirm a finding isn't an artifact of this particular
+# seed. Shared by both load-test scripts' --seed default.
+DEFAULT_SEED = 42
+
+
+# --- Request planning (seeded determinism) -----------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class RequestPlan:
+    """One request's precomputed random decisions -- see
+    generate_request_plan for why these are generated synchronously, up
+    front, before the timed portion of a run starts, rather than drawn
+    live by workers as the run executes.
+    """
+
+    is_read: bool
+    key: str
+    # Index into the caller's own list of read targets (followers, for
+    # leader-follower; nodes, for leaderless's read coordinator) --
+    # meaningful only when is_read is True. Writes need no random
+    # target here: leader-follower always writes to the one leader,
+    # and leaderless picks its write coordinator by round robin
+    # (NodeRotation) rather than randomly, so neither needs a
+    # precomputed decision for "which node".
+    read_target_index: int | None
+
+
+def _derive_seeds(seed: int, count: int) -> list[int]:
+    """Derive `count` independent seeds from one top-level `seed`, via
+    a throwaway random.Random(seed) rather than e.g. seed, seed + 1,
+    seed + 2, ... -- so nearby top-level seeds (1 vs. 2) don't produce
+    suspiciously-related derived seeds for each concern.
+    """
+    deriver = random.Random(seed)
+    return [deriver.getrandbits(64) for _ in range(count)]
+
+
+def generate_request_plan(
+    total_requests: int,
+    keys: list[str],
+    num_read_targets: int,
+    *,
+    read_fraction: float,
+    seed: int,
+) -> list[RequestPlan]:
+    """Precompute the full sequence of per-request random decisions --
+    read vs. write, which key, and (for reads) which target index --
+    for an entire run, before the timed portion starts.
+
+    This is what actually makes `seed` reproducible, not just a timing
+    nicety: with NUM_WORKERS concurrent async workers each otherwise
+    calling into a *shared* random instance live during the timed loop,
+    which worker's request draws which random value next depends on
+    event-loop scheduling -- not deterministic even with a fixed seed,
+    since asyncio gives no ordering guarantee across concurrently
+    awaiting workers. Pre-generating the whole sequence up front (a
+    plain synchronous loop, no I/O, no concurrency) removes the
+    scheduling dependency entirely: split_plan() below hands each
+    worker a fixed, contiguous slice of this list to consume strictly
+    in order, so which decision lands in which worker's Nth request is
+    fixed by `seed` alone, never by timing.
+
+    Uses three independent random.Random instances -- one each for the
+    read/write mix, key selection, and read-target selection -- derived
+    from the single `seed` (see _derive_seeds), so each concern's
+    sequence is isolated from the others: an unrelated random call
+    added elsewhere in this module later can't shift an existing
+    concern's sequence for a seed that's already documented as
+    producing a given run's numbers.
+
+    Real timing/scheduling -- which request actually happens *when*
+    relative to another, how long each takes -- is not, and cannot be,
+    covered by any of this: two runs with the same seed make the exact
+    same sequence of decisions, but under real concurrent network I/O
+    can still observe different staleness, since staleness depends on
+    whether a read's real arrival happens to race a write's real
+    in-flight replication. See docs/results.md's methodology note (and
+    README.md's "Results" section) for measured run-to-run variance
+    under a fixed seed.
+    """
+    mix_seed, key_seed, target_seed = _derive_seeds(seed, 3)
+    mix_rng = random.Random(mix_seed)
+    key_rng = random.Random(key_seed)
+    target_rng = random.Random(target_seed)
+
+    plan: list[RequestPlan] = []
+    for _ in range(total_requests):
+        is_read = mix_rng.random() < read_fraction
+        key = key_rng.choice(keys)
+        read_target_index = target_rng.randrange(num_read_targets) if is_read else None
+        plan.append(RequestPlan(is_read=is_read, key=key, read_target_index=read_target_index))
+    return plan
+
+
+def split_plan(plan: list[RequestPlan], num_workers: int) -> list[list[RequestPlan]]:
+    """Split `plan` into `num_workers` contiguous chunks, as evenly as
+    possible (the first `len(plan) % num_workers` chunks get one extra
+    element) -- the same split TOTAL_REQUESTS used to get divided
+    across workers directly (a bare request count), just applied to the
+    precomputed plan instead.
+    """
+    base, remainder = divmod(len(plan), num_workers)
+    chunks: list[list[RequestPlan]] = []
+    start = 0
+    for i in range(num_workers):
+        size = base + (1 if i < remainder else 0)
+        chunks.append(plan[start:start + size])
+        start += size
+    return chunks
 
 
 # --- Shared state -----------------------------------------------------------
