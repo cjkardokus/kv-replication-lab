@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import time
@@ -43,8 +44,9 @@ import httpx
 import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
+from pydantic import ValidationError
 
-from common.server import PutRequest, PutResponse, create_app
+from common.server import PutRequest, PutResponse, ReplicateResponse, create_app
 from common.storage import KVStore
 
 logger = logging.getLogger(__name__)
@@ -360,8 +362,26 @@ class Replicator:
                     "replicate to %s failed", follower.replicate_url, exc_info=True
                 )
                 return False
-        body = resp.json()
-        if not body.get("applied", True):
+        # Validate against the real response schema rather than indexing
+        # resp.json() as a raw dict -- a follower that responds 200 with
+        # a non-JSON or incomplete body (a crashed/misbehaving node, a
+        # proxy injecting a body, a version-skewed peer) must not crash
+        # this coroutine with an uncaught exception: json.JSONDecodeError
+        # ("not valid JSON") and pydantic.ValidationError ("valid JSON,
+        # wrong/missing fields") are handled identically here, the same
+        # as httpx.HTTPError above -- a failed ack, not a raised
+        # exception that would otherwise propagate out of replicate()
+        # and surface to the client as a bare 500 instead of the usual
+        # "N/M acks" 503.
+        try:
+            parsed = ReplicateResponse.model_validate(resp.json())
+        except (json.JSONDecodeError, ValidationError):
+            logger.warning(
+                "replicate to %s returned a malformed response body",
+                follower.replicate_url, exc_info=True,
+            )
+            return False
+        if not parsed.applied:
             logger.warning(
                 "replicate to %s was received but not applied "
                 "(follower already held a newer/equal write) key=%s",

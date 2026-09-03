@@ -32,6 +32,7 @@ import httpx
 import pytest
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from starlette.responses import PlainTextResponse
 
 from common.server import KVResponse, ReplicateResponse, create_app
 from common.storage import KVStore
@@ -220,6 +221,52 @@ def _slow_peer_app(node_id: str, storage: KVStore, *, replicate_delay: float) ->
             body["key"], body["value"], timestamp=body["timestamp"], node_id=body["node_id"]
         )
         return ReplicateResponse(applied=applied)
+
+    return app
+
+
+def _malformed_replicate_peer_app(node_id: str, storage: KVStore) -> FastAPI:
+    """A peer whose /internal/replicate responds 200 OK with a non-JSON
+    body -- exercises QuorumCoordinator._replicate_outcome's malformed-
+    response handling (see docs/AUDIT_FINDINGS.md's §3): must be treated
+    as a failed ack, not crash the write path with an unhandled 500.
+    """
+    app = _peer_app(node_id, storage)
+
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if not (
+            getattr(route, "path", None) == "/internal/replicate"
+            and "POST" in getattr(route, "methods", ())
+        )
+    ]
+
+    @app.post("/internal/replicate")
+    def malformed_replicate(body: dict) -> PlainTextResponse:  # type: ignore[type-arg]
+        return PlainTextResponse("not json", status_code=200)
+
+    return app
+
+
+def _malformed_read_peer_app(node_id: str, storage: KVStore) -> FastAPI:
+    """A peer whose GET /internal/kv/{key} responds 200 OK with a
+    non-JSON body -- exercises QuorumCoordinator._read_outcome's
+    malformed-response handling (see docs/AUDIT_FINDINGS.md's §3): must
+    be treated as a failed response, not crash the read path with an
+    unhandled 500.
+    """
+    app = _peer_app(node_id, storage)
+
+    app.router.routes = [
+        route
+        for route in app.router.routes
+        if getattr(route, "path", None) != "/internal/kv/{key}"
+    ]
+
+    @app.get("/internal/kv/{key}")
+    def malformed_internal_get(key: str) -> PlainTextResponse:
+        return PlainTextResponse("not json", status_code=200)
 
     return app
 
@@ -448,6 +495,58 @@ def test_fault_inject_delay_delays_replicate_ack_and_apply(cluster):
     assert elapsed >= 0.3
     entry = httpx.get(f"http://{server.host}:{server.port}/internal/kv/k").json()
     assert entry["value"] == "v1"
+
+
+# --- Malformed peer response handling ---------------------------------------
+
+
+def test_write_malformed_peer_response_fails_ack_not_500(cluster):
+    """docs/AUDIT_FINDINGS.md's §3: a peer that responds 200 with a
+    malformed body used to crash the write path with an unhandled 500
+    (json.JSONDecodeError propagating out of _replicate_outcome, through
+    _gather(), to the client) instead of being counted as a plain failed
+    ack. With one good peer and one malformed one at w=3 (needing both
+    peers' acks), only the good one can ever ack -- this should fail
+    loudly with the project's usual 503/"N/M acks" shape, never a 500.
+    """
+    ports = [_free_port() for _ in range(3)]
+    nodes = [Node(host="127.0.0.1", port=p) for p in ports]
+    config = ClusterConfig(nodes=nodes, default_w=3, default_r=2, timeout_seconds=1.0)
+
+    cluster(_peer_app("good", KVStore()), ports[1])
+    cluster(_malformed_replicate_peer_app("malformed", KVStore()), ports[2])
+    coordinator = cluster(build_app("coord", ports[0], config), ports[0])
+
+    resp = httpx.put(f"http://{coordinator.host}:{coordinator.port}/kv/k", json={"value": "v1"})
+
+    assert resp.status_code == 503
+    assert "2/3" in resp.json()["detail"]
+
+
+def test_read_malformed_peer_response_fails_response_not_500(cluster):
+    """Same bug, read side: a peer's GET /internal/kv/{key} responding
+    200 with a malformed body used to crash the read path with an
+    unhandled 500 (a bare KeyError indexing resp.json() in
+    _read_outcome) instead of counting as a failed response. With the
+    coordinator's only peer malformed and r=2 (needing that peer's
+    response), quorum can't be reached -- 503, never a 500.
+    """
+    ports = [_free_port() for _ in range(2)]
+    nodes = [Node(host="127.0.0.1", port=p) for p in ports]
+    config = ClusterConfig(nodes=nodes, default_w=1, default_r=2, timeout_seconds=1.0)
+
+    cluster(_malformed_read_peer_app("malformed", KVStore()), ports[1])
+    coordinator = cluster(build_app("coord", ports[0], config), ports[0])
+
+    put_resp = httpx.put(
+        f"http://{coordinator.host}:{coordinator.port}/kv/k", json={"value": "v1"}, params={"w": 1}
+    )
+    assert put_resp.status_code == 200
+
+    read_resp = httpx.get(f"http://{coordinator.host}:{coordinator.port}/kv/k", params={"r": 2})
+
+    assert read_resp.status_code == 503
+    assert "1/2" in read_resp.json()["detail"]
 
 
 # --- ClusterConfig parsing --------------------------------------------------
