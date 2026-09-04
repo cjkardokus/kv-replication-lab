@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 
 import uvicorn
 from fastapi import FastAPI
 
+from common.cli import add_node_identity_args
 from common.server import create_app
 from common.storage import KVStore
 
@@ -38,23 +38,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a leader-follower KV follower node."
     )
-    parser.add_argument(
-        "--node-id",
-        default=os.environ.get("NODE_ID"),
-        required=os.environ.get("NODE_ID") is None,
-        help="Unique identifier for this node (env: NODE_ID).",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host/interface to bind (env: HOST, default 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8001")),
-        help="Port to bind (env: PORT, default 8001).",
-    )
+    add_node_identity_args(parser, default_port=8001)
     return parser.parse_args(argv)
 
 

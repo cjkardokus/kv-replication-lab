@@ -64,6 +64,7 @@ from aiokafka.errors import KafkaError
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+from common.cli import add_node_identity_args
 from common.server import PutRequest, PutResponse, ReplicateRequest
 from message_queue.config import MQConfig
 from message_queue.topics import ensure_topic_exists
@@ -182,23 +183,7 @@ def build_app(node_id: str, config: MQConfig) -> FastAPI:
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a message-queue KV producer node.")
-    parser.add_argument(
-        "--node-id",
-        default=os.environ.get("NODE_ID"),
-        required=os.environ.get("NODE_ID") is None,
-        help="Unique identifier for this node (env: NODE_ID).",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host/interface to bind (env: HOST, default 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8200")),
-        help="Port to bind (env: PORT, default 8200).",
-    )
+    add_node_identity_args(parser, default_port=8200)
     parser.add_argument(
         "--config",
         default=os.environ.get("MQ_CONFIG", DEFAULT_CONFIG_PATH),
