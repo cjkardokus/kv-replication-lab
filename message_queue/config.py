@@ -26,6 +26,8 @@ from typing import Any
 
 import yaml
 
+from common.config import require_nonempty_str
+
 
 @dataclass(frozen=True, slots=True)
 class MQConfig:
@@ -38,17 +40,17 @@ class MQConfig:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> MQConfig:
-        bootstrap_servers = str(raw.get("bootstrap_servers", "")).strip()
-        topic = str(raw.get("topic", "")).strip()
-        consumer_group_prefix = str(raw.get("consumer_group_prefix", "")).strip()
+        bootstrap_servers = require_nonempty_str(str(raw.get("bootstrap_servers", "")), "bootstrap_servers")
+        topic = require_nonempty_str(str(raw.get("topic", "")), "topic")
+        consumer_group_prefix = require_nonempty_str(
+            str(raw.get("consumer_group_prefix", "")), "consumer_group_prefix"
+        )
         num_partitions = int(raw.get("num_partitions", 0))
 
-        if not bootstrap_servers:
-            raise ValueError("bootstrap_servers must be a non-empty string")
-        if not topic:
-            raise ValueError("topic must be a non-empty string")
-        if not consumer_group_prefix:
-            raise ValueError("consumer_group_prefix must be a non-empty string")
+        # Not require_in_range: this is an open lower bound (no upper
+        # bound to speak of) with its own message shape -- see
+        # common/config.py's own docstring for why it stays a plain
+        # inline check rather than a force-fit onto that helper.
         if num_partitions < 1:
             raise ValueError(f"num_partitions must be >= 1, got {num_partitions}")
 

@@ -130,6 +130,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import ValidationError
 
 from common.cli import add_node_identity_args
+from common.config import require_in_range, require_positive
 from common.models import VersionedValue
 from common.replication_client import build_replication_client
 from common.server import (
@@ -223,10 +224,7 @@ class ClusterConfig:
 
         cls._validate_quorum(default_w, "default_w", nodes)
         cls._validate_quorum(default_r, "default_r", nodes)
-        if timeout_seconds <= 0:
-            raise ValueError(
-                f"timeout_seconds must be positive, got {timeout_seconds}"
-            )
+        require_positive(timeout_seconds, "timeout_seconds")
 
         return cls(
             nodes=nodes,
@@ -243,12 +241,7 @@ class ClusterConfig:
 
     @staticmethod
     def _validate_quorum(value: int, name: str, nodes: list[Node]) -> None:
-        n = len(nodes)
-        if not 1 <= value <= n:
-            raise ValueError(
-                f"{name} ({value}) must be between 1 and the number of "
-                f"nodes ({n})"
-            )
+        require_in_range(value, name, 1, len(nodes), "nodes")
 
     def with_default_w(self, default_w: int) -> ClusterConfig:
         """Return a copy of this config with default_w overridden, e.g.

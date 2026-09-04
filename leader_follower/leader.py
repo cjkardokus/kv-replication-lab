@@ -47,6 +47,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
 from common.cli import add_node_identity_args
+from common.config import require_in_range, require_positive
 from common.replication_client import build_replication_client
 from common.server import PutRequest, PutResponse, ReplicateResponse, create_app, replace_route
 from common.storage import KVStore
@@ -232,10 +233,7 @@ class ClusterConfig:
         timeout_seconds = float(raw.get("timeout_seconds", 2.0))
 
         cls._validate_ack_required(ack_required, followers)
-        if timeout_seconds <= 0:
-            raise ValueError(
-                f"timeout_seconds must be positive, got {timeout_seconds}"
-            )
+        require_positive(timeout_seconds, "timeout_seconds")
 
         return cls(
             followers=followers,
@@ -251,11 +249,7 @@ class ClusterConfig:
 
     @staticmethod
     def _validate_ack_required(ack_required: int, followers: list[Follower]) -> None:
-        if not 0 <= ack_required <= len(followers):
-            raise ValueError(
-                f"ack_required ({ack_required}) must be between 0 and "
-                f"the number of followers ({len(followers)})"
-            )
+        require_in_range(ack_required, "ack_required", 0, len(followers), "followers")
 
     def with_ack_required(self, ack_required: int) -> ClusterConfig:
         """Return a copy of this config with ack_required overridden,
