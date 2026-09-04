@@ -67,6 +67,17 @@ per message instead of a batched one. For this lab's scale and this
 branch's purpose (making lag precisely measurable, so a later branch's
 load test can correlate a stale read with the lag that caused it), that
 trade is the right one.
+
+Fault injection (--fault-inject-consume-delay-ms, off by default):
+This follower's consume loop can be given an artificial per-message
+delay, applied before applying/committing each message, purely to
+manufacture visible consumer lag on demand for
+experiments/mq_lag_demo.py -- the same role leaderless/node.py's
+--fault-inject-delay-ms plays for its own boundary-case demo. Disabled
+(0, the default), this loop is exactly as described above; it is never
+driven by MQConfig/the cluster YAML, only by this process's own CLI
+flag/env var, so it can never be silently enabled by cluster config
+alone. See build_app() for where it's wired in.
 """
 
 from __future__ import annotations
@@ -191,9 +202,25 @@ def _apply_message(raw: bytes, storage: KVStore, node_id: str) -> tuple[Replicat
     return parsed, applied
 
 
-async def _consume_loop(consumer: AIOKafkaConsumer, storage: KVStore, node_id: str) -> None:
+async def _consume_loop(
+    consumer: AIOKafkaConsumer,
+    storage: KVStore,
+    node_id: str,
+    *,
+    fault_inject_delay_seconds: float = 0.0,
+) -> None:
     """Apply every message this follower's consumer receives to `storage`,
     forever, until cancelled (app shutdown).
+
+    `fault_inject_delay_seconds` is TEST/BENCHMARK-ONLY (see build_app's
+    own docstring) and defaults to 0.0, meaning completely disabled: a
+    positive value sleeps for that long, per message, *before* applying
+    and committing it -- purely to manufacture visible consumer lag on
+    demand for experiments/mq_lag_demo.py, the same role leaderless/
+    node.py's --fault-inject-delay-ms plays for its own boundary-case
+    demo. Nothing else about this loop's behavior changes: the delay
+    runs before the same _apply_message/commit sequence below, not
+    instead of it.
 
     Commits this message's offset immediately after applying it (the
     consumer is built with enable_auto_commit=False -- see build_app) --
@@ -204,6 +231,8 @@ async def _consume_loop(consumer: AIOKafkaConsumer, storage: KVStore, node_id: s
     accurate.
     """
     async for message in consumer:
+        if fault_inject_delay_seconds > 0:
+            await asyncio.sleep(fault_inject_delay_seconds)
         result = _apply_message(message.value, storage, node_id)
         if result is not None:
             parsed, applied = result
@@ -215,11 +244,19 @@ async def _consume_loop(consumer: AIOKafkaConsumer, storage: KVStore, node_id: s
         await consumer.commit({tp: message.offset + 1})
 
 
-def build_app(node_id: str, config: MQConfig) -> FastAPI:
+def build_app(node_id: str, config: MQConfig, *, fault_inject_consume_delay_seconds: float = 0.0) -> FastAPI:
     """Build a follower app: common.server's generic app (its own fresh
     KVStore, same as leader_follower/follower.py), plus a background
     Kafka consumer task wired to startup/shutdown that's the only writer
     to that KVStore in normal operation.
+
+    `fault_inject_consume_delay_seconds` is TEST/BENCHMARK-ONLY (see
+    _consume_loop's own docstring) and defaults to 0.0 -- completely
+    disabled, in which case this follower's consume loop behaves
+    exactly as it always has. It is never driven by MQConfig/the
+    cluster YAML, only by this process's own CLI flag/env var, so it
+    can never be silently enabled by cluster config alone -- same
+    guarantee leaderless/node.py's own fault-injection flag makes.
     """
     storage = KVStore()
     app = create_app(storage, node_id)
@@ -245,7 +282,12 @@ def build_app(node_id: str, config: MQConfig) -> FastAPI:
         )
         await consumer.start()
         state["consumer"] = consumer
-        state["task"] = asyncio.ensure_future(_consume_loop(consumer, storage, node_id))
+        state["task"] = asyncio.ensure_future(
+            _consume_loop(
+                consumer, storage, node_id,
+                fault_inject_delay_seconds=fault_inject_consume_delay_seconds,
+            )
+        )
 
     async def _on_shutdown() -> None:
         task = state.get("task")
@@ -302,14 +344,32 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("MQ_CONFIG", DEFAULT_CONFIG_PATH),
         help=f"Path to the MQ cluster config YAML (env: MQ_CONFIG, default {DEFAULT_CONFIG_PATH}).",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--fault-inject-consume-delay-ms",
+        type=float,
+        default=float(os.environ.get("FAULT_INJECT_CONSUME_DELAY_MS", "0")),
+        help=(
+            "TEST/BENCHMARK ONLY: artificial delay (milliseconds) this "
+            "follower's consume loop sleeps before applying/committing "
+            "each message -- purely to manufacture visible consumer lag "
+            "on demand (see experiments/mq_lag_demo.py). 0 (default) "
+            "disables this entirely (env: FAULT_INJECT_CONSUME_DELAY_MS)."
+        ),
+    )
+    args = parser.parse_args(argv)
+    if args.fault_inject_consume_delay_ms < 0:
+        parser.error("--fault-inject-consume-delay-ms must be >= 0")
+    return args
 
 
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO)
     args = _parse_args(argv)
     config = MQConfig.from_yaml(args.config)
-    app = build_app(args.node_id, config)
+    app = build_app(
+        args.node_id, config,
+        fault_inject_consume_delay_seconds=args.fault_inject_consume_delay_ms / 1000.0,
+    )
     uvicorn.run(app, host=args.host, port=args.port)
 
 
