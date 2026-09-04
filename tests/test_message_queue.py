@@ -1,5 +1,6 @@
 """Tests for message_queue/: MQConfig, the producer/follower wire
-schema, and the real producer -> Kafka -> follower write path.
+schema, the real producer -> Kafka -> follower write path, follower
+reads, topic reset (lifecycle), and consumer lag.
 
 Testing approach
 -----------------
@@ -51,17 +52,18 @@ import uuid
 from collections.abc import Callable
 
 import pytest
+from aiokafka import AIOKafkaConsumer
 from aiokafka.admin import AIOKafkaAdminClient
 from fastapi.testclient import TestClient
 
 from common.server import ReplicateRequest
 from common.storage import KVStore
 from message_queue.config import MQConfig
-from message_queue.follower import _apply_message
+from message_queue.follower import PartitionLag, _apply_message, _compute_lag
 from message_queue.follower import build_app as build_follower_app
 from message_queue.producer import _build_message
 from message_queue.producer import build_app as build_producer_app
-from message_queue.topics import ensure_topic_exists
+from message_queue.topics import ensure_topic_exists, reset_topic
 
 BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 
@@ -320,3 +322,174 @@ def test_multiple_followers_each_get_full_replica_independently(mq_config):
         for client in follower_clients:
             for key in keys:
                 assert client.get(f"/kv/{key}").json()["value"] == f"v-{key}"
+
+
+# --- Read path ---------------------------------------------------------
+
+
+@pytest.mark.kafka_integration
+def test_follower_read_returns_full_kv_response(mq_config):
+    # A dedicated, pinned contract test for the read path (branch 3):
+    # the other write-path tests above already incidentally exercise
+    # GET, but this nails down the exact response shape -- the same
+    # KVResponse shape (key/value/timestamp/node_id) leader_follower's
+    # and leaderless's own GET endpoints return, per common/server.py.
+    producer_app = build_producer_app("producer-1", mq_config)
+    follower_app = build_follower_app("follower-1", mq_config)
+
+    with TestClient(producer_app) as producer_client, TestClient(follower_app) as follower_client:
+        put_resp = producer_client.put("/kv/k1", json={"value": {"nested": "v1"}})
+        assert put_resp.status_code == 200
+        put_body = put_resp.json()
+
+        def _follower_has_it() -> bool:
+            resp = follower_client.get("/kv/k1")
+            return resp.status_code == 200 and resp.json()["timestamp"] == put_body["timestamp"]
+
+        _wait_until(_follower_has_it)
+
+        resp = follower_client.get("/kv/k1")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert set(body.keys()) == {"key", "value", "timestamp", "node_id"}
+        assert body["key"] == "k1"
+        assert body["value"] == {"nested": "v1"}
+        assert body["timestamp"] == put_body["timestamp"]
+        assert body["node_id"] == "producer-1"
+
+
+@pytest.mark.kafka_integration
+def test_follower_read_missing_key_returns_404(mq_config):
+    follower_app = build_follower_app("follower-1", mq_config)
+    with TestClient(follower_app) as follower_client:
+        resp = follower_client.get("/kv/never-written")
+        assert resp.status_code == 404
+
+
+# --- Topic lifecycle (reset_topic) --------------------------------------
+
+
+@pytest.mark.kafka_integration
+def test_reset_topic_produces_clean_slate(mq_config):
+    # Write something before the reset.
+    producer_before = build_producer_app("producer-before", mq_config)
+    with TestClient(producer_before) as client:
+        resp = client.put("/kv/before-reset", json={"value": "old"})
+        assert resp.status_code == 200
+        put_body = resp.json()
+
+    # Sanity check: a follower joining *before* the reset really does
+    # see it -- otherwise a later 404 wouldn't prove anything about the
+    # reset specifically (it could just mean nothing was ever written).
+    follower_before = build_follower_app("follower-before", mq_config)
+    with TestClient(follower_before) as client:
+
+        def _has_it() -> bool:
+            resp = client.get("/kv/before-reset")
+            return resp.status_code == 200 and resp.json()["timestamp"] == put_body["timestamp"]
+
+        _wait_until(_has_it)
+
+    asyncio.run(reset_topic(mq_config))
+
+    follower_after = build_follower_app("follower-after", mq_config)
+    with TestClient(follower_after) as client:
+        # There's no positive condition to poll *for* here -- "nothing
+        # ever arrives" has no event to observe -- so this waits out a
+        # fixed window instead, long enough for this follower's
+        # consumer to have joined, been assigned every partition, and
+        # (if the reset genuinely failed to clear anything) consumed
+        # and applied the pre-reset write.
+        time.sleep(3.0)
+        resp = client.get("/kv/before-reset")
+        assert resp.status_code == 404
+
+        # The reset topic is genuinely usable afterward, not just
+        # emptied forever -- a fresh write on it still replicates
+        # normally.
+        producer_after = build_producer_app("producer-after", mq_config)
+        with TestClient(producer_after) as producer_client:
+            put_resp = producer_client.put("/kv/after-reset", json={"value": "new"})
+            assert put_resp.status_code == 200
+
+        _wait_until(lambda: client.get("/kv/after-reset").status_code == 200)
+        assert client.get("/kv/after-reset").json()["value"] == "new"
+
+
+# --- Consumer lag --------------------------------------------------------
+
+
+@pytest.mark.kafka_integration
+def test_lag_reflects_unconsumed_backlog_accurately(mq_config):
+    # A "paused" follower: a real consumer that joins this follower's
+    # would-be group and gets a real partition assignment (so
+    # end_offsets()/committed() reflect a real, live broker state), but
+    # never runs a consume loop -- standing in for a follower that's
+    # fallen behind or stalled. Lag must reflect the exact backlog size,
+    # not just "some positive number."
+    producer_app = build_producer_app("producer-1", mq_config)
+    num_messages = 5
+
+    async def _run() -> list[PartitionLag]:
+        await ensure_topic_exists(mq_config)
+        consumer = AIOKafkaConsumer(
+            mq_config.topic,
+            bootstrap_servers=mq_config.bootstrap_servers,
+            group_id=f"{mq_config.consumer_group_prefix}-paused",
+            auto_offset_reset="earliest",
+            enable_auto_commit=False,
+        )
+        await consumer.start()
+        try:
+            deadline = time.monotonic() + 15.0
+            while not consumer.assignment():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("paused consumer never got a partition assignment")
+                await asyncio.sleep(0.1)
+
+            # Produce while this consumer stays connected (assigned,
+            # committed at 0) but reads nothing.
+            with TestClient(producer_app) as client:
+                for i in range(num_messages):
+                    resp = client.put(f"/kv/k{i}", json={"value": i})
+                    assert resp.status_code == 200
+
+            return await _compute_lag(consumer)
+        finally:
+            await consumer.stop()
+
+    partitions = asyncio.run(_run())
+    assert sum(p.lag for p in partitions) == num_messages
+    # Nothing was ever applied/committed by this consumer -- every
+    # partition's own committed offset is still its starting point.
+    assert all((p.committed_offset or 0) == 0 for p in partitions)
+    # And every reported end_offset - committed_offset really is what
+    # lag claims, per partition, not just in aggregate.
+    assert all(p.lag == p.end_offset - (p.committed_offset or 0) for p in partitions)
+
+
+@pytest.mark.kafka_integration
+def test_lag_reaches_zero_once_follower_catches_up(mq_config):
+    # Complements the paused-consumer test above with the healthy-path
+    # case, through the real /internal/lag HTTP route (not just
+    # _compute_lag directly): a follower that's actually running its
+    # consume loop should see lag return to 0 once it's caught up.
+    producer_app = build_producer_app("producer-1", mq_config)
+    follower_app = build_follower_app("follower-1", mq_config)
+
+    with TestClient(producer_app) as producer_client, TestClient(follower_app) as follower_client:
+        for i in range(5):
+            resp = producer_client.put(f"/kv/k{i}", json={"value": i})
+            assert resp.status_code == 200
+
+        def _lag_is_zero() -> bool:
+            resp = follower_client.get("/internal/lag")
+            return resp.status_code == 200 and resp.json()["total_lag"] == 0
+
+        _wait_until(_lag_is_zero, timeout_s=20.0)
+
+        body = follower_client.get("/internal/lag").json()
+        assert body["node_id"] == "follower-1"
+        assert body["total_lag"] == 0
+        assert len(body["partitions"]) == mq_config.num_partitions
+        assert all(p["lag"] == 0 for p in body["partitions"])

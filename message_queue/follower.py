@@ -6,10 +6,21 @@ module for what each route does; PUT and /internal/replicate exist here
 only because create_app() is reused wholesale rather than a
 stripped-down variant, the same accepted quirk leader_follower's and
 leaderless's own followers/nodes already have -- nothing in this
-strategy's write path ever calls them). The one thing genuinely new
-here: a background Kafka consumer task, started at app startup, that's
-the *only* way this follower's KVStore gets populated in normal
-operation -- see producer.py for the write path this consumes from.
+strategy's write path ever calls them). GET /kv/{key} is this
+strategy's real read path: it serves whatever this follower's local
+KVStore currently has, with no coordination and no waiting on the
+consumer to "catch up" to anything -- there is no code here that could
+add such a wait even if it wanted to, since create_app()'s generic
+handler just does storage.get(). A read landing right after a write can
+therefore legitimately see stale (or, before the first message ever
+arrives, missing) data; that staleness, and how it correlates with
+/internal/lag below, is the whole point of this strategy, not a gap in
+its read path.
+
+The one thing genuinely new here beyond common/server.py: a background
+Kafka consumer task, started at app startup, that's the *only* way this
+follower's KVStore gets populated in normal operation -- see producer.py
+for the write path this consumes from.
 
 Each follower joins its OWN Kafka consumer group
 ("{consumer_group_prefix}-{node_id}"), not a shared one. With exactly
@@ -29,7 +40,9 @@ follower (by its node_id-derived group id) ever joins; a restart of the
 *same* follower resumes from its last committed offset via Kafka's own
 consumer-group offset tracking, rather than replaying the full topic
 again -- ordinary Kafka consumer-group semantics, not anything this
-module implements itself.
+module implements itself. See message_queue/topics.py's reset_topic()
+for how a later branch's sweep gives every config a genuinely clean
+slate instead (deleting the topic itself, not just resetting offsets).
 
 Applies each consumed message via KVStore.put() -- the same LWW-safe
 write path /internal/replicate already uses for leader_follower/
@@ -43,6 +56,17 @@ comparison -- not this module -- is what actually guarantees a late/
 out-of-order write can never overwrite something newer, the same
 guarantee it already gives the other two strategies. This module never
 assumes partitioning alone is enough and skips the check.
+
+The consumer commits its offset synchronously, right after applying
+each message (enable_auto_commit=False; see _consume_loop) rather than
+relying on aiokafka's default periodic auto-commit. This is what makes
+GET /internal/lag below an accurate, real-time measure of "how many
+applied writes is this follower missing" rather than one that's stale
+by up to an auto-commit interval -- at the cost of a broker round trip
+per message instead of a batched one. For this lab's scale and this
+branch's purpose (making lag precisely measurable, so a later branch's
+load test can correlate a stale read with the lag that caused it), that
+trade is the right one.
 """
 
 from __future__ import annotations
@@ -55,9 +79,9 @@ import os
 from typing import Any
 
 import uvicorn
-from aiokafka import AIOKafkaConsumer
-from fastapi import FastAPI
-from pydantic import ValidationError
+from aiokafka import AIOKafkaConsumer, TopicPartition
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, ValidationError
 
 from common.server import ReplicateRequest, create_app
 from common.storage import KVStore
@@ -67,6 +91,77 @@ from message_queue.topics import ensure_topic_exists
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = "config/mq_cluster.yaml"
+
+
+class PartitionLag(BaseModel):
+    """This follower's consumer lag on one partition.
+
+    `committed_offset` is None if this follower has never committed
+    anything on this partition yet (a brand-new follower that hasn't
+    consumed its first message here) -- `lag` still reports a real
+    number in that case (the full end_offset), treating "never
+    committed" as committed_offset=0, not as "unknown"/omitted.
+    """
+
+    partition: int
+    end_offset: int
+    committed_offset: int | None
+    lag: int
+
+
+class LagResponse(BaseModel):
+    """Response for GET /internal/lag.
+
+    `total_lag` is the plain sum of every partition's own lag -- fine
+    as a single headline number (see this module's own docstring for
+    why it's accurate in real time), but `partitions` keeps the
+    breakdown available since it's cheap to compute alongside the total
+    (see _compute_lag) and a later branch's load test may want it.
+    """
+
+    node_id: str
+    total_lag: int
+    partitions: list[PartitionLag]
+
+
+async def _compute_lag(consumer: AIOKafkaConsumer) -> list[PartitionLag]:
+    """Compute `consumer`'s real lag, per partition currently assigned
+    to it.
+
+    lag = end_offset (the broker's true log-end offset, via
+    AIOKafkaConsumer.end_offsets()) minus this consumer's own last
+    committed offset (via AIOKafkaConsumer.committed()) -- deliberately
+    not aiokafka's own in-memory position(), which would also count
+    messages already fetched-and-applied-but-not-yet-committed as
+    "caught up". Since follower.py's consumer commits synchronously
+    right after applying each message (see _consume_loop), committed()
+    already reflects true applied progress in real time, so this stays
+    an accurate, per-partition measure rather than one fuzzed by an
+    auto-commit interval or by in-flight-but-uncommitted fetches.
+
+    Factored out of the /internal/lag route below so it's directly
+    testable against a real, freestanding AIOKafkaConsumer (e.g. one
+    that never runs _consume_loop at all, standing in for a
+    stalled/paused follower) without needing a full follower app.
+    """
+    partitions = consumer.assignment()
+    if not partitions:
+        return []
+
+    end_offsets = await consumer.end_offsets(partitions)
+    result = []
+    for tp in sorted(partitions, key=lambda tp: tp.partition):
+        committed = await consumer.committed(tp)
+        end_offset = end_offsets[tp]
+        result.append(
+            PartitionLag(
+                partition=tp.partition,
+                end_offset=end_offset,
+                committed_offset=committed,
+                lag=end_offset - (committed or 0),
+            )
+        )
+    return result
 
 
 def _apply_message(raw: bytes, storage: KVStore, node_id: str) -> tuple[ReplicateRequest, bool] | None:
@@ -99,16 +194,25 @@ def _apply_message(raw: bytes, storage: KVStore, node_id: str) -> tuple[Replicat
 async def _consume_loop(consumer: AIOKafkaConsumer, storage: KVStore, node_id: str) -> None:
     """Apply every message this follower's consumer receives to `storage`,
     forever, until cancelled (app shutdown).
+
+    Commits this message's offset immediately after applying it (the
+    consumer is built with enable_auto_commit=False -- see build_app) --
+    a malformed message is committed past too, same as an applied one,
+    since either way this follower is done with it and shouldn't see it
+    again on a restart. See this module's own docstring for why
+    per-message synchronous commits are what makes GET /internal/lag
+    accurate.
     """
     async for message in consumer:
         result = _apply_message(message.value, storage, node_id)
-        if result is None:
-            continue
-        parsed, applied = result
-        logger.info(
-            "follower %s: consumed key=%s partition=%s offset=%s applied=%s",
-            node_id, parsed.key, message.partition, message.offset, applied,
-        )
+        if result is not None:
+            parsed, applied = result
+            logger.info(
+                "follower %s: consumed key=%s partition=%s offset=%s applied=%s",
+                node_id, parsed.key, message.partition, message.offset, applied,
+            )
+        tp = TopicPartition(message.topic, message.partition)
+        await consumer.commit({tp: message.offset + 1})
 
 
 def build_app(node_id: str, config: MQConfig) -> FastAPI:
@@ -132,6 +236,12 @@ def build_app(node_id: str, config: MQConfig) -> FastAPI:
             bootstrap_servers=config.bootstrap_servers,
             group_id=f"{config.consumer_group_prefix}-{node_id}",
             auto_offset_reset="earliest",
+            # See this module's own docstring: commits happen
+            # synchronously per message in _consume_loop instead, so
+            # GET /internal/lag's committed()-based lag is accurate in
+            # real time rather than stale by up to an auto-commit
+            # interval.
+            enable_auto_commit=False,
         )
         await consumer.start()
         state["consumer"] = consumer
@@ -149,6 +259,19 @@ def build_app(node_id: str, config: MQConfig) -> FastAPI:
 
     app.router.add_event_handler("startup", _on_startup)
     app.router.add_event_handler("shutdown", _on_shutdown)
+
+    @app.get("/internal/lag", response_model=LagResponse)
+    async def get_lag(request: Request) -> LagResponse:
+        logger.info("method=%s path=%s", request.method, request.url.path)
+        consumer = state.get("consumer")
+        if consumer is None:
+            # Startup hasn't run yet (or somehow never assigned a
+            # consumer) -- fail loudly rather than report a fake 0 lag
+            # that would look like "fully caught up."
+            raise HTTPException(status_code=503, detail="Kafka consumer not started yet")
+        partitions = await _compute_lag(consumer)
+        return LagResponse(node_id=node_id, total_lag=sum(p.lag for p in partitions), partitions=partitions)
+
     return app
 
 
