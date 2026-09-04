@@ -28,5 +28,80 @@ jobs:
       - name: Run mypy
         run: mypy
 
-      - name: Run pytest
-        run: pytest
+      # Deliberately excludes message_queue/'s Kafka-integration tests
+      # (pytest.mark.kafka_integration) -- those need a real broker and
+      # run in the separate test-mq job below instead, specifically so
+      # a Kafka-side problem (a slow/flaky service container, a broker
+      # that never reports healthy) can never fail *this* job and take
+      # down the leader-follower/leaderless/common test gate with it.
+      # This job's own pytest run needs no broker at all: those tests
+      # are simply deselected, not run-and-skipped.
+      - name: Run pytest (excluding Kafka integration tests)
+        run: pytest -m "not kafka_integration"
+
+  test-mq:
+    name: test-mq
+    runs-on: ubuntu-latest
+    # A real Kafka broker, in KRaft mode, same image/config shape as
+    # docker-compose.kafka.yml (see that file for the full rationale
+    # behind each setting) -- kept in sync with it by hand, since
+    # GitHub Actions services don't support reading a compose file
+    # directly. GitHub Actions publishes service container ports to the
+    # runner's own localhost, so this is reachable the same way the
+    # local broker is (see tests/test_message_queue.py's
+    # KAFKA_BOOTSTRAP_SERVERS default).
+    services:
+      kafka:
+        image: apache/kafka:4.1.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --health-start-period 20s
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      # Belt-and-suspenders on top of the service container's own
+      # --health-cmd gating above: confirms the broker is actually
+      # accepting connections before pytest gets anywhere near it,
+      # rather than relying solely on the service block's health check
+      # timing. tests/test_message_queue.py's own require_kafka fixture
+      # would skip cleanly either way, but this makes a genuinely-dead
+      # broker fail fast and loud here instead of quietly skipping
+      # every test and looking like a pass.
+      - name: Wait for Kafka broker to accept connections
+        run: |
+          for i in $(seq 1 30); do
+            python3 -c "import socket; socket.create_connection(('localhost', 9092), timeout=2).close()" && exit 0
+            sleep 2
+          done
+          echo "Kafka broker never became reachable on localhost:9092" >&2
+          exit 1
+
+      - name: Run Kafka-integration tests
+        run: pytest -m kafka_integration -v

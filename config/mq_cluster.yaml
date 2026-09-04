@@ -1,0 +1,39 @@
+# Message-queue (Kafka) replication strategy config.
+#
+# Consumed by message_queue/producer.py and message_queue/follower.py
+# (MQConfig.from_yaml). Unlike the other two strategies' cluster
+# configs, there's no list of peer addresses here at all -- the
+# producer and followers never talk to each other directly, only to
+# Kafka (see message_queue/producer.py's module docstring for why
+# that's the point of this strategy). Every follower is started
+# independently (own --node-id/--port, like the other two strategies)
+# and needs nothing beyond this file to find the same topic every other
+# node uses.
+
+# Kafka broker address, as a single "host:port" string (comma-separate
+# for a multi-broker cluster -- not applicable to this lab's
+# single-node broker; see docker-compose.kafka.yml).
+bootstrap_servers: "localhost:9092"
+
+# Topic every write is published to, and every follower consumes from.
+# Created automatically (with num_partitions below) by whichever node
+# starts first, if it doesn't already exist -- see
+# message_queue/topics.py's ensure_topic_exists.
+topic: "kv-replication-lab"
+
+# Partitions for the topic above. Writes are partitioned by a hash of
+# the KV key (aiokafka's default partitioner, verified in
+# experiments/kafka_smoke_test.py), so every write to a given key always
+# lands in the same partition -- this is what keeps that key's writes
+# in a single strictly-ordered log, which LWW-by-arrival-order depends
+# on. 4, to match leader_follower's 4 followers for comparability.
+num_partitions: 4
+
+# Prefix for each follower's Kafka consumer group id -- the actual
+# group id is "{consumer_group_prefix}-{node_id}", one distinct group
+# per follower. This is what makes every follower consume the FULL
+# topic independently (every partition, full replication) rather than
+# splitting work across followers the way members of one shared
+# consumer group would -- see message_queue/follower.py's module
+# docstring for why that's the deliberate choice here.
+consumer_group_prefix: "kv-mq-follower"
