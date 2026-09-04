@@ -32,3 +32,11 @@ strict = true
 module = "tests.*"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
+
+# aiokafka ships no py.typed marker / stub package (unlike PyYAML, which
+# has types-PyYAML in requirements-dev.txt) -- without this, every import
+# of it fails strict mode with import-untyped, not a real type error in
+# this project's own code.
+[[tool.mypy.overrides]]
+module = "aiokafka.*"
+ignore_missing_imports = true

@@ -17,6 +17,12 @@ Early development. Local, single-machine implementation in progress. An AWS
 deployment phase (via Terraform, on EC2) is planned as a follow-up once the
 local version is working and validated — see [Roadmap](#roadmap).
 
+A third replication strategy (message-queue/Kafka-based) is in progress
+alongside the two below. So far this covers infrastructure only — a local
+Kafka broker and a standalone smoke test proving produce/consume and
+key-based partition routing work, no replication logic yet — see
+[`docs/kafka-setup.md`](docs/kafka-setup.md).
+
 ## Architecture
 
 Two replication strategies, sharing a common storage/server layer:
