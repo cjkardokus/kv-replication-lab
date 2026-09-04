@@ -20,7 +20,7 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.mypy]
 python_version = "3.12"  # matches .github/workflows/tests.yml's CI runtime
-files = ["common", "leader_follower", "leaderless", "experiments", "tests"]
+files = ["common", "leader_follower", "leaderless", "message_queue", "experiments", "tests"]
 strict = true
 # The one deliberate loosening from full strict mode: test files use
 # fixtures and helper params without type hints in a few spots (pytest's
@@ -40,3 +40,15 @@ disallow_incomplete_defs = false
 [[tool.mypy.overrides]]
 module = "aiokafka.*"
 ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+  # See tests/test_message_queue.py's module docstring: tests carrying
+  # this marker need a real Kafka broker at KAFKA_BOOTSTRAP_SERVERS
+  # (default localhost:9092) and self-skip (not fail) if one isn't
+  # reachable. .github/workflows/tests.yml runs them in their own job,
+  # against a real Kafka service container, deselected from the main
+  # "test" job so a Kafka-side problem there can never fail the other
+  # two strategies' tests.
+  "kafka_integration: requires a real Kafka broker; see docs/kafka-setup.md.",
+]
