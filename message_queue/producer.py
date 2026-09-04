@@ -38,17 +38,16 @@ common/models.py) stays identical across all three strategies; only the
 transport differs. See follower.py for the consumer side.
 
 The producer holds no KV data of its own -- no KVStore, no GET/DELETE.
-It only ever publishes to Kafka; reads are a follower's job (a later
-branch). A single producer node is the design here (mirroring
-leader_follower's single leader), not a pool of them -- see
-message_queue/config.py's MQConfig, which has no notion of multiple
-producers.
+It only ever publishes to Kafka; reads (and the consumer-lag metric that
+explains their staleness) are a follower's job -- see follower.py. A
+single producer node is the design here (mirroring leader_follower's
+single leader), not a pool of them -- see message_queue/config.py's
+MQConfig, which has no notion of multiple producers.
 
-Out of scope for this branch (see the branch history for the full
-staged plan): no GET endpoint anywhere in this strategy yet, no
-fresh-topic-per-run lifecycle management beyond message_queue/topics.py's
-minimal ensure_topic_exists, no consumer-lag metric, no load test, no
-run_comparison.py integration.
+Still out of scope (see the branch history for the full staged plan):
+no load test, no run_comparison.py integration -- message_queue/topics.py's
+reset_topic() is the primitive that integration will use to reset
+between sweep configs, but nothing calls it yet.
 """
 
 from __future__ import annotations
