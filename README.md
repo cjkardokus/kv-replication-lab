@@ -5,8 +5,8 @@ configuration choices — leader-follower vs. leaderless, quorum settings,
 acknowledgment thresholds — affect performance, consistency, and fault
 tolerance.
 
-This project implements two replication strategies side by side against the
-same underlying key-value data model, with tunable parameters so the
+This project implements three replication strategies side by side against
+the same underlying key-value data model, with tunable parameters so the
 trade-offs between them (concepts drawn from *Designing Data-Intensive
 Applications*) are directly observable through experiments rather than
 theoretical.
@@ -17,15 +17,15 @@ Early development. Local, single-machine implementation in progress. An AWS
 deployment phase (via Terraform, on EC2) is planned as a follow-up once the
 local version is working and validated — see [Roadmap](#roadmap).
 
-A third replication strategy (message-queue/Kafka-based) is in progress
-alongside the two below. So far this covers infrastructure only — a local
-Kafka broker and a standalone smoke test proving produce/consume and
-key-based partition routing work, no replication logic yet — see
-[`docs/kafka-setup.md`](docs/kafka-setup.md).
+A third replication strategy (message-queue/Kafka-based) is now implemented
+and benchmarked alongside the two below — see the Architecture and Results
+sections. It runs against a local, single-node Kafka broker (KRaft mode, no
+ZooKeeper); see [`docs/kafka-setup.md`](docs/kafka-setup.md) for how to start
+it and run its own smoke test.
 
 ## Architecture
 
-Two replication strategies, sharing a common storage/server layer:
+Three replication strategies, sharing a common storage/server layer:
 
 ### Leader-follower
 
@@ -48,6 +48,44 @@ Two replication strategies, sharing a common storage/server layer:
   node ID as a tiebreaker) for now.
 - No read-repair yet — planned for a future iteration.
 
+### Message-queue (Kafka-based)
+
+- One producer node accepts all writes and publishes each one to a Kafka
+  topic, partitioned by a hash of the key (so every write to a given key
+  lands in the same partition and stays strictly ordered within it). The
+  producer **acks the client as soon as the write is durably in the Kafka
+  log** — before any follower has consumed it, let alone applied it.
+- This is the core distinction from the other two strategies: leader-follower
+  and leaderless both have the coordinating node wait on some number of
+  replica acknowledgments (`ack_required`, or `W`) before acking the client.
+  This strategy has no such wait at all — replication to followers happens
+  entirely asynchronously, decoupled from the client-facing write path.
+  Staleness here is therefore bounded by **consumer lag/throughput, not by
+  network/ack timing** — a different kind of unboundedness than either other
+  strategy can express: theirs is bounded by picking how many replicas to
+  wait for (with a mathematical floor at `ack_required=N`/`W=N`); this one
+  has nothing to wait for in the first place, so its bound is "how fast can
+  a follower keep up," not "how many replicas said yes."
+- Each follower runs its **own independent Kafka consumer group** and
+  consumes the entire topic (every partition), applying writes to its own
+  local copy as they arrive — full-topic replication, the same
+  every-node-holds-a-complete-copy guarantee leader-follower's followers and
+  leaderless's peers both give. This is the architecturally correct design
+  for what this project models, not a simplification: a **shared**,
+  work-splitting consumer group (Kafka's standard pattern for scaling
+  consumption, where each partition — and so each portion of the keyspace —
+  is handled by only one group member) would mean each follower holds only
+  part of the data, i.e. **sharding**, not replication. That's a genuinely
+  different architecture answering a different question (how to scale
+  reads/storage across nodes) from the one this project compares (how many
+  copies of the same data exist, and how consistent are they) — see
+  [Roadmap](#roadmap).
+- Followers serve reads directly from their local copy, exactly like
+  leader-follower's followers — no coordination, no waiting on the consumer
+  to "catch up." Each follower's real-time consumer lag (broker log-end
+  offset minus that follower's own last committed offset) is directly
+  queryable, not just inferred from staleness — see Results.
+
 ### Shared
 
 - Versioning uses wall-clock timestamps. **Known limitation:** clock skew
@@ -59,9 +97,10 @@ Two replication strategies, sharing a common storage/server layer:
 
 ## Results
 
-`docs/results.md` is auto-generated (by `experiments/run_comparison.py` and
-`experiments/leaderless_boundary_case_demo.py` — see that file's own header)
-and contains only tables, raw numbers, and a run timestamp: no hand-authored
+`docs/results.md` is auto-generated (by `experiments/run_comparison.py`,
+`experiments/leaderless_boundary_case_demo.py`, and
+`experiments/mq_lag_demo.py` — see that file's own header) and contains only
+tables, raw numbers, and a run timestamp: no hand-authored
 analysis, on purpose. An earlier version of this project hardcoded that kind
 of analysis directly into the generator script, as a fixed string
 reproduced in every report regardless of what the table above it actually
@@ -189,30 +228,113 @@ script's own module docstring for the full exploration (what delay/subset
 sizes were tried and why they were or weren't enough), and the current
 `docs/results.md` for this run's actual numbers.
 
+### Message-queue staleness tracks load directly — there's no ack-wait knob to trade off
+
+Unlike `ack_required` or `W`/`R`, the message-queue strategy has no
+client-facing wait-and-ack setting at all (see Architecture above) — so its
+sweep (`experiments/mq_staleness_load_test.py`'s `--workers`, swept by
+`experiments/run_comparison.py`'s `run_mq_configs`) varies load intensity
+instead of an ack threshold, and its own section of `docs/results.md`
+(mq-sweep) shows a clean, monotonic staleness rise with load, reproduced
+across independent runs: roughly 1.5% at the lowest worker count, up through
+high single digits, into the 30s-40% range at the highest — see that
+section for the current run's exact figures. A follower's Kafka consumer
+genuinely falls further behind the producer's write rate as concurrent load
+increases; that's the whole trade-off this strategy exists to demonstrate,
+made directly visible rather than argued for.
+
+Getting a clean signal took a real fix, not just running the sweep: the
+first attempt measured close to 100% staleness at *every* worker count — an
+artifact of the test harness, not the replication strategy. The node-startup
+check `run_comparison.py` already uses for the other two strategies only
+confirms a follower's HTTP server is serving (`/health`); for a
+message-queue follower, that happens *before* its background Kafka consumer
+has actually joined its consumer group and been assigned partitions, which
+takes real (if usually brief) time, and the load test's reads were starting
+well before it did. `_wait_for_mq_followers_assigned` (polling the
+follower's own `/internal/lag` endpoint until it reports a real partition
+assignment) closed that race — unmasking the genuine, load-driven staircase
+above.
+
+Also worth noting for anyone reading `docs/results.md`'s raw per-config
+JSONL logs: `lag_at_stale_read` is sampled only on a *detected-stale* read,
+never unconditionally on every read. An unconditional per-read lag query
+would add a round trip to every single read (not just the small stale
+fraction), changing this script's own timing/throughput characteristics
+relative to the other two strategies' load tests, which query nothing extra
+per read — comparing elapsed times across strategies would stop being
+apples to apples. Sampling only on staleness keeps this script's per-read
+cost identical to theirs, at the cost of that field being a point-in-time
+diagnostic sample rather than a continuous measurement.
+
+### Demonstrating message-queue consumer lag directly, not just inferring it from staleness
+
+The sweep above shows staleness rising with load, but "consumer lag" is
+still an inference from that number unless it's measured directly.
+`message_queue/follower.py`'s opt-in, off-by-default fault-injection flag
+(`--fault-inject-consume-delay-ms`) — the same pattern as leaderless's
+`--fault-inject-delay-ms` above — sleeps for a fixed duration before
+applying/committing each consumed message, purely to manufacture a real,
+controllable backlog on demand. `experiments/mq_lag_demo.py` runs the same
+4-follower cluster with this flag enabled on a *subset* of the followers
+(default: 2 of 4, 500ms/message) at an otherwise-modest load level, then
+reports each follower's actual lag (via its own `/internal/lag`) immediately
+after the run.
+
+The result ties staleness directly to measurable lag rather than leaving
+the connection implicit: in the run cited in `docs/results.md`'s
+mq-lag-demo section, the two delayed followers ended the run with a lag of
+2976 messages each — still visibly working through their backlog — while
+the two undelayed followers, consuming the identical topic with no
+artificial slowdown, had already drained theirs (9 and 0). Overall staleness
+for that run (68.72%) landed well above this same worker count's
+undelayed baseline in the mq-sweep table, consistent with the delayed
+followers' backlog being exactly what a fraction of reads were landing on.
+
 ## Roadmap
 
 The project is being built in deliberate stages, starting narrow and adding
 complexity once each stage is validated:
 
-1. **Local, single-machine version** (current stage) — both replication
+1. **Local, single-machine version** (current stage) — all three replication
    strategies working correctly, with experiments demonstrating the
-   ack/quorum trade-offs described above.
+   ack/quorum/load trade-offs described above.
 2. **AWS deployment** (planned fork) — nodes deployed to separate EC2
    instances via Terraform, turning the clock-skew limitation above into a
    concrete, demonstrable experiment rather than a theoretical caveat.
 3. **Future iterations** (not yet scheduled): fault injection (killing nodes
    mid-write to observe failure behavior), read-repair for the leaderless
-   path, read-your-own-writes consistency, a Redis caching layer to
-   explore cache staleness alongside replication staleness, and a shared
-   `ClusterConfig` base for leader_follower and leaderless (currently
-   duplicated scaffolding — `from_dict`/`from_yaml`/`_validate_*`/`with_*`
-   — around differently-shaped config fields). Deliberately deferred
-   rather than extracted now: leader-follower and leaderless are only two
-   examples to generalize from, and the message-queue replication path
-   (also planned) will be a third whose config shape isn't known yet —
-   extracting a shared base now risks designing it wrong for that third
-   shape and needing a second refactor, where waiting means doing it once,
-   correctly informed.
+   path, read-your-own-writes consistency, and a Redis caching layer to
+   explore cache staleness alongside replication staleness. Beyond those:
+
+   - A **sharded/partitioned message-queue variant**, using standard Kafka
+     consumer-group work-splitting (a *shared* consumer group across
+     followers, so each one holds only part of the keyspace) instead of
+     `message_queue/follower.py`'s current design (one independent group
+     per follower, full-topic replication on every one). This would be a
+     genuinely different architecture from the full-replication strategies
+     compared here, not an extension of this one — see Architecture above.
+   - A **multi-broker Kafka cluster**, for real inter-broker
+     replication/leader election (currently a single-node broker, per
+     `docker-compose.kafka.yml`) — deferred alongside the AWS deployment
+     stage above, for the same reason leader-follower/leaderless's own
+     topology has stayed local/single-machine through this hardening pass:
+     RAM constraints on the local dev machine this project has been built
+     on so far.
+   - A shared `ClusterConfig` base for leader_follower, leaderless, *and*
+     message_queue (currently duplicated scaffolding —
+     `from_dict`/`from_yaml`/`_validate_*`/`with_*` — around
+     differently-shaped config fields). Still deliberately deferred, now
+     with all three shapes known rather than two:
+     `message_queue/config.py`'s `MQConfig` turned out to share nothing
+     with the other two beyond the `from_dict`/`from_yaml` pattern itself
+     — no peer/follower address list at all, since Kafka itself is the
+     coordination mechanism, not this project's own HTTP fan-out — which
+     confirms the original deferral was the right call rather than just
+     settling it. A shared base remains possible, just clearly narrower
+     than it would have looked from only two examples: the real
+     duplication across all three is the *pattern*
+     (`from_dict`/`from_yaml`/validation), not shared *fields*.
 
 ## Why this project
 
@@ -220,7 +342,7 @@ Built to make the trade-offs described in *Designing Data-Intensive
 Applications*'s replication chapter concrete and measurable, rather than
 just implementing "a" distributed key-value store. The goal is a project
 where a specific design choice (e.g., `ack_required=0` vs. `ack_required=N`)
-produces a visible, explainable difference in behavior — not just two
+produces a visible, explainable difference in behavior — not just several
 working implementations.
 
 ## License
