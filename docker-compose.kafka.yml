@@ -1,6 +1,12 @@
-# Single-node Kafka broker for the upcoming message-queue replication
-# strategy (message_queue/, not yet implemented -- this is infrastructure
-# only, see docs/kafka-setup.md).
+# Single-node Kafka broker for the message-queue replication strategy
+# (message_queue/, built and integrated -- see README.md for the strategy
+# itself). This file backs local dev: `message_queue/` nodes,
+# `experiments/kafka_smoke_test.py`, and `tests/test_message_queue.py`'s
+# kafka_integration-marked tests all connect to whatever broker this
+# starts. CI runs its own separate, ephemeral Kafka service container
+# (see .github/workflows/tests.yml's test-mq job) rather than this
+# compose file -- see docs/kafka-setup.md for the full broker-lifecycle
+# picture.
 #
 # KRaft mode (no ZooKeeper): a single container plays both the
 # "controller" and "broker" roles, which is the current standard way to
