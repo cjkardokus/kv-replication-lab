@@ -52,7 +52,7 @@ import uuid
 from collections.abc import Callable
 
 import pytest
-from aiokafka import AIOKafkaConsumer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.admin import AIOKafkaAdminClient
 from fastapi.testclient import TestClient
 
@@ -322,6 +322,66 @@ def test_multiple_followers_each_get_full_replica_independently(mq_config):
         for client in follower_clients:
             for key in keys:
                 assert client.get(f"/kv/{key}").json()["value"] == f"v-{key}"
+
+
+# --- Malformed message handling (integration) -------------------------
+
+
+@pytest.mark.kafka_integration
+def test_follower_skips_malformed_message_and_keeps_consuming(mq_config):
+    """test_follower_apply_message_skips_malformed_message_without_raising
+    above already proves _apply_message itself handles a malformed
+    message in isolation (a plain KVStore, no consumer, no broker) --
+    this is the real-consume-loop counterpart, matching the bar
+    leader_follower's and leaderless's own malformed-response tests hold
+    (spin up something that misbehaves for real and drive the actual
+    path end to end, not just the parsing function alone): a genuinely
+    malformed message published to a real topic must not crash or stall
+    a follower's background consume loop, and a well-formed message
+    behind it on the same partition must still be applied normally.
+
+    The malformed message is published directly via a raw
+    AIOKafkaProducer, bypassing producer.py/_build_message entirely --
+    however a bad message ended up on the topic (not necessarily a
+    producer.py bug at all), a follower has to survive it regardless of
+    the source.
+    """
+
+    async def _publish_malformed() -> None:
+        await ensure_topic_exists(mq_config)
+        producer = AIOKafkaProducer(bootstrap_servers=mq_config.bootstrap_servers)
+        await producer.start()
+        try:
+            # Same key ("k1") the well-formed write below uses, so both
+            # land in the same partition and are consumed in that order
+            # -- the malformed message must be seen and skipped *before*
+            # the well-formed one is applied, not just eventually.
+            await producer.send_and_wait(mq_config.topic, key=b"k1", value=b"not json")
+        finally:
+            await producer.stop()
+
+    asyncio.run(_publish_malformed())
+
+    producer_app = build_producer_app("producer-1", mq_config)
+    follower_app = build_follower_app("follower-1", mq_config)
+
+    with TestClient(producer_app) as producer_client, TestClient(follower_app) as follower_client:
+        put_resp = producer_client.put("/kv/k1", json={"value": "v1"})
+        assert put_resp.status_code == 200
+        put_body = put_resp.json()
+
+        def _follower_has_it() -> bool:
+            resp = follower_client.get("/kv/k1")
+            return resp.status_code == 200 and resp.json()["timestamp"] == put_body["timestamp"]
+
+        # If the malformed message ahead of this one stalled or crashed
+        # the consume loop, this well-formed write would never show up
+        # here and _wait_until would time out.
+        _wait_until(_follower_has_it)
+
+        entry = follower_client.get("/kv/k1").json()
+        assert entry["value"] == "v1"
+        assert entry["node_id"] == "producer-1"
 
 
 # --- Read path ---------------------------------------------------------
