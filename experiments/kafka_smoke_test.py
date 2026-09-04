@@ -1,11 +1,13 @@
 """Standalone smoke test for the local Kafka broker (docker-compose.kafka.yml).
 
-Not part of any real replication logic -- the message-queue replication
-strategy itself (a message_queue/ package, mirroring leader_follower/ and
-leaderless/) doesn't exist yet. This script's only job is to prove the
-infrastructure and client library (aiokafka) actually behave the way the
-rest of that strategy will be built to assume, empirically rather than
-by reading aiokafka's docs:
+Not part of any real replication logic -- message_queue/ (mirroring
+leader_follower/ and leaderless/, see README.md for the strategy itself)
+has its own, separate integration tests (tests/test_message_queue.py) and
+doesn't depend on this script. This one's job is narrower and stays
+useful independent of that: prove the infrastructure and client library
+(aiokafka) actually behave the way message_queue/ is built to assume,
+empirically rather than by reading aiokafka's docs, in isolation from any
+of this project's own replication logic:
 
   1. A topic can be deleted and recreated safely, even when a prior run
      of this same script left one behind -- so this script is safe to
