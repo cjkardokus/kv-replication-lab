@@ -94,6 +94,7 @@ from aiokafka import AIOKafkaConsumer, TopicPartition
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ValidationError
 
+from common.cli import add_node_identity_args
 from common.server import ReplicateRequest, create_app
 from common.storage import KVStore
 from message_queue.config import MQConfig
@@ -319,25 +320,13 @@ def build_app(node_id: str, config: MQConfig, *, fault_inject_consume_delay_seco
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a message-queue KV follower node.")
-    parser.add_argument(
-        "--node-id",
-        default=os.environ.get("NODE_ID"),
-        required=os.environ.get("NODE_ID") is None,
-        help=(
+    add_node_identity_args(
+        parser,
+        default_port=8201,
+        node_id_help=(
             "Unique identifier for this node (env: NODE_ID). Also used "
             "to derive this follower's own Kafka consumer group id."
         ),
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host/interface to bind (env: HOST, default 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8201")),
-        help="Port to bind (env: PORT, default 8201).",
     )
     parser.add_argument(
         "--config",

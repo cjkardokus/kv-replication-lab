@@ -129,6 +129,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import ValidationError
 
+from common.cli import add_node_identity_args
 from common.models import VersionedValue
 from common.replication_client import build_replication_client
 from common.server import (
@@ -696,22 +697,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a leaderless (quorum-based) KV node."
     )
-    parser.add_argument(
-        "--node-id",
-        default=os.environ.get("NODE_ID"),
-        required=os.environ.get("NODE_ID") is None,
-        help="Unique identifier for this node (env: NODE_ID).",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host/interface to bind (env: HOST, default 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8001")),
-        help=(
+    add_node_identity_args(
+        parser,
+        default_port=8001,
+        port_help=(
             "Port to bind (env: PORT, default 8001). Also used to find "
             "this node's own entry in the cluster config, so its peers "
             "list excludes itself."

@@ -46,6 +46,7 @@ import yaml
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import ValidationError
 
+from common.cli import add_node_identity_args
 from common.replication_client import build_replication_client
 from common.server import PutRequest, PutResponse, ReplicateResponse, create_app, replace_route
 from common.storage import KVStore
@@ -471,23 +472,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a leader-follower KV leader node."
     )
-    parser.add_argument(
-        "--node-id",
-        default=os.environ.get("NODE_ID"),
-        required=os.environ.get("NODE_ID") is None,
-        help="Unique identifier for this node (env: NODE_ID).",
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("HOST", "0.0.0.0"),
-        help="Host/interface to bind (env: HOST, default 0.0.0.0).",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=int(os.environ.get("PORT", "8000")),
-        help="Port to bind (env: PORT, default 8000).",
-    )
+    add_node_identity_args(parser, default_port=8000)
     parser.add_argument(
         "--config",
         default=os.environ.get("CLUSTER_CONFIG", DEFAULT_CONFIG_PATH),

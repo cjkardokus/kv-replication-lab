@@ -36,14 +36,11 @@ speed.
 
 from __future__ import annotations
 
-import socket
-import threading
 import time
 from unittest.mock import patch
 
 import httpx
 import pytest
-import uvicorn
 from fastapi import FastAPI
 from starlette.responses import PlainTextResponse
 
@@ -63,47 +60,17 @@ from leader_follower.leader import (
 from leader_follower.leader import (
     build_app as build_leader_app,
 )
+from tests._server_harness import RunningServer, _free_port
 
 # --- Real-server test harness --------------------------------------------
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-class RunningServer:
-    """A uvicorn server running one ASGI app in a background thread.
-
-    Real socket, real event loop, separate from pytest's -- so calls
-    against it exercise the same code paths a production deployment
-    would.
-    """
-
-    def __init__(self, app: FastAPI) -> None:
-        self.host = "127.0.0.1"
-        self.port = _free_port()
-        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="warning")
-        self.server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self.server.run, daemon=True)
-
-    def start(self) -> RunningServer:
-        self._thread.start()
-        deadline = time.time() + 5
-        while not self.server.started:
-            if time.time() > deadline:
-                raise RuntimeError("uvicorn server did not start in time")
-            time.sleep(0.01)
-        return self
-
-    def stop(self) -> None:
-        self.server.should_exit = True
-        self._thread.join(timeout=5)
-
-    @property
-    def address(self) -> Follower:
-        return Follower(host=self.host, port=self.port)
+#
+# See tests/_server_harness.py's own docstring: shared with
+# test_leaderless.py, extracted once both independently defined the
+# identical _free_port()/RunningServer (see docs/AUDIT_FINDINGS.md's §7).
+# This strategy's own servers don't need their own port up front (a
+# leader/follower doesn't need to know its own address before
+# build_app() runs), so `cluster` here doesn't pass one -- RunningServer
+# auto-allocates it, exactly like before this was shared.
 
 
 @pytest.fixture
@@ -111,10 +78,10 @@ def cluster():
     """Yields a factory for starting real servers; stops them all after
     the test regardless of outcome.
     """
-    servers: list[RunningServer] = []
+    servers: list[RunningServer[Follower]] = []
 
-    def _start(app: FastAPI) -> RunningServer:
-        server = RunningServer(app).start()
+    def _start(app: FastAPI) -> RunningServer[Follower]:
+        server = RunningServer(app, Follower).start()
         servers.append(server)
         return server
 

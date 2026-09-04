@@ -24,13 +24,10 @@ stock common.server app.
 
 from __future__ import annotations
 
-import socket
-import threading
 import time
 
 import httpx
 import pytest
-import uvicorn
 from fastapi import FastAPI, HTTPException
 from starlette.responses import PlainTextResponse
 
@@ -43,47 +40,16 @@ from leaderless.node import (
     _resolve_config,
     build_app,
 )
+from tests._server_harness import RunningServer, _free_port
 
 # --- Real-server test harness --------------------------------------------
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-
-
-class RunningServer:
-    """A uvicorn server running one ASGI app in a background thread, on
-    a caller-chosen port. The port is chosen by the caller (not picked
-    internally, unlike test_leader_follower.py's harness) because
-    leaderless nodes need to know their own port *before* the app is
-    built, to compute their peers list.
-    """
-
-    def __init__(self, app: FastAPI, host: str, port: int) -> None:
-        self.host = host
-        self.port = port
-        config = uvicorn.Config(app, host=self.host, port=self.port, log_level="warning")
-        self.server = uvicorn.Server(config)
-        self._thread = threading.Thread(target=self.server.run, daemon=True)
-
-    def start(self) -> RunningServer:
-        self._thread.start()
-        deadline = time.time() + 5
-        while not self.server.started:
-            if time.time() > deadline:
-                raise RuntimeError("uvicorn server did not start in time")
-            time.sleep(0.01)
-        return self
-
-    def stop(self) -> None:
-        self.server.should_exit = True
-        self._thread.join(timeout=5)
-
-    @property
-    def address(self) -> Node:
-        return Node(host=self.host, port=self.port)
+#
+# See tests/_server_harness.py's own docstring: shared with
+# test_leader_follower.py, extracted once both independently defined the
+# identical _free_port()/RunningServer (see docs/AUDIT_FINDINGS.md's §7).
+# Unlike that strategy, leaderless nodes need to know their own port
+# *before* the app is built, to compute their peers list -- so `cluster`
+# here passes one explicitly, same as before this was shared.
 
 
 @pytest.fixture
@@ -91,10 +57,10 @@ def cluster():
     """Yields a factory for starting real servers on chosen ports; stops
     them all after the test regardless of outcome.
     """
-    servers: list[RunningServer] = []
+    servers: list[RunningServer[Node]] = []
 
-    def _start(app: FastAPI, port: int) -> RunningServer:
-        server = RunningServer(app, "127.0.0.1", port).start()
+    def _start(app: FastAPI, port: int) -> RunningServer[Node]:
+        server = RunningServer(app, Node, host="127.0.0.1", port=port).start()
         servers.append(server)
         return server
 
@@ -107,7 +73,7 @@ def cluster():
 def _build_cluster(
     cluster, node_ids: list[str], *, default_w: int, default_r: int,
     timeout_seconds: float = 2.0,
-) -> tuple[list[RunningServer], ClusterConfig]:
+) -> tuple[list[RunningServer[Node]], ClusterConfig]:
     """Start len(node_ids) real leaderless nodes (via node.build_app),
     each configured with the full node list so every one's peers are
     every other one.
@@ -125,7 +91,7 @@ def _build_cluster(
     return servers, config
 
 
-def _seed(server: RunningServer, key: str, *, value, timestamp: float, node_id: str) -> None:
+def _seed(server: RunningServer[Node], key: str, *, value, timestamp: float, node_id: str) -> None:
     """Write a specific (value, timestamp, node_id) directly to one
     node's storage via /internal/replicate, bypassing coordinator logic
     entirely -- so tests can set up specific staleness/ownership
