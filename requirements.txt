@@ -6,6 +6,7 @@
 # Dev/test-only tooling (pytest, ruff, mypy, ...) lives in
 # requirements-dev.txt instead, which includes this file -- see that
 # file for why the split.
+aiokafka==0.14.0
 fastapi==0.141.1
 httpx==0.28.1
 pydantic==2.13.4
