@@ -35,13 +35,15 @@ RESULTS_HEADER = (
     "# Replication strategy comparison results\n"
     "\n"
     "> **Auto-generated -- do not hand-edit.** This file is rebuilt by "
-    "two scripts, each owning one section marked below: "
-    "`experiments/run_comparison.py` (main sweep) and "
-    "`experiments/leaderless_boundary_case_demo.py` (boundary-case "
-    "demo). Manual edits inside either marked section are overwritten "
-    "the next time that section's script runs. For the hand-maintained "
-    "interpretation of these numbers -- why they look the way they do "
-    "-- see the top-level `README.md`'s \"Results\" section."
+    "three scripts, each owning one or more sections marked below: "
+    "`experiments/run_comparison.py` (main sweep and message-queue "
+    "sweep), `experiments/leaderless_boundary_case_demo.py` "
+    "(boundary-case demo), and `experiments/mq_lag_demo.py` "
+    "(message-queue lag demo). Manual edits inside any marked section "
+    "are overwritten the next time that section's script runs. For the "
+    "hand-maintained interpretation of these numbers -- why they look "
+    "the way they do -- see the top-level `README.md`'s \"Results\" "
+    "section."
 )
 
 
