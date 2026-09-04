@@ -324,6 +324,64 @@ def test_multiple_followers_each_get_full_replica_independently(mq_config):
                 assert client.get(f"/kv/{key}").json()["value"] == f"v-{key}"
 
 
+# --- Producer failure handling (integration) ----------------------------
+
+
+@pytest.mark.kafka_integration
+def test_producer_write_fails_loudly_with_503_when_kafka_rejects_it(mq_config):
+    """put_key's `except KafkaError` branch -- this strategy's own
+    "fail loudly, never partial success" 503, the direct analog of
+    leader-follower's unmet-ack_required 503
+    (test_unmet_ack_required_fails_loudly_within_timeout) and
+    leaderless's unmet-W/R 503 (test_write_times_out_when_w_not_reached)
+    -- had no coverage anywhere before this test.
+
+    Forcing a real KafkaError out of send_and_wait, without breaking the
+    shared broker for other concurrent tests, rules out most of the
+    obvious approaches: pointing bootstrap_servers at an unreachable
+    broker fails startup instead (ensure_topic_exists/producer.start()
+    raise first, so the app never comes up -- the wrong thing to test,
+    a 000/connection error, not a clean 503); deliberately never
+    creating the topic doesn't work either, because _on_startup already
+    calls ensure_topic_exists(config) against this producer's own
+    config.topic before any request can arrive, which creates it if
+    missing -- there is no way to reach put_key with config.topic still
+    absent.
+
+    What reliably isolates the failure to send_and_wait specifically,
+    confirmed empirically before writing this test: a PUT body large
+    enough that its serialized ReplicateRequest exceeds
+    AIOKafkaProducer's own max_request_size (1_048_576 bytes, aiokafka's
+    default -- see aiokafka.producer.producer.AIOKafkaProducer._serialize).
+    That check runs synchronously inside producer.send() itself, before
+    any network I/O -- no broker cooperation, no retry/timeout race, and
+    nothing about startup (which never touches message size) is
+    affected. It raises aiokafka.errors.MessageSizeTooLargeError, a real
+    KafkaError subclass -- confirmed non-retriable, so this doesn't
+    incur aiokafka's own retry-until-request_timeout_ms behavior (a real
+    but very different failure mode: 40s by default, and not what this
+    test is about) the way a broker-side retriable error like
+    NotEnoughReplicasError would have.
+    """
+    producer_app = build_producer_app("producer-1", mq_config)
+
+    with TestClient(producer_app) as client:
+        # A normal write still succeeds against this same app/config --
+        # confirms the failure below is specific to this one oversized
+        # request, not something wrong with the producer/topic setup
+        # itself.
+        normal_resp = client.put("/kv/normal-key", json={"value": "v1"})
+        assert normal_resp.status_code == 200
+
+        oversized_value = "x" * 2_000_000  # well over the 1_048_576-byte limit once serialized
+        resp = client.put("/kv/big-key", json={"value": oversized_value})
+
+        assert resp.status_code == 503
+        detail = resp.json()["detail"]
+        assert detail.startswith("Kafka did not confirm this write:")
+        assert "MessageSizeTooLargeError" in detail
+
+
 # --- Malformed message handling (integration) -------------------------
 
 
